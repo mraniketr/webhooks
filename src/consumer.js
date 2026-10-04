@@ -2,8 +2,9 @@ import { processDelivery, processEvent } from "./processing.js";
 
 // Consumer worker for both queues.
 //
-// - `hooklane-events` (main queue): run pre-actions (collecting pre[]),
-//   fan out one task per subscription into `hooklane-deliveries`, then ack.
+// - `hooklane-events` (main queue): run the single pre-action (setting the
+//   `pre` key-value object), fan out one task per subscription into
+//   `hooklane-deliveries`, then ack.
 //   Delivery failures never block this queue.
 // - `hooklane-deliveries` (task queue): forward one event to one URL with
 //   its own retry budget, logged in the deliveries table.

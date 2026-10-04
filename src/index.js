@@ -142,18 +142,18 @@ function webhookView(w, request) {
 
 function normalizeActions(input) {
   if (!Array.isArray(input)) return null; // null = not provided, leave unchanged
-  const out = [];
+  // Single pre-action only: keep the first item with code.
   for (const item of input) {
     // Only pre-actions are supported (post phase removed).
-    if (!item || !item.code) continue;
-    out.push({
+    if (!item || !item.code || !String(item.code).trim()) continue;
+    return [{
       phase: "pre",
-      name: String(item.name || `Pre-action ${out.length + 1}`).slice(0, 100),
+      name: String(item.name || "Pre-action").slice(0, 100),
       code: String(item.code).slice(0, 20000),
       enabled: item.enabled === false ? 0 : 1,
-    });
+    }];
   }
-  return out;
+  return [];
 }
 
 function isValidUrlTemplate(target) {
@@ -318,7 +318,7 @@ async function sampleContextForWebhook(env, wid) {
     eventRow = await env.DB.prepare("SELECT id,webhook_id,method,headers_json,payload_json,raw_body,ip,received_at FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
   }
   if (!eventRow) {
-    const empty = buildContext(null, webhook, [{ enriched: true, userId: 123 }]);
+    const empty = buildContext(null, webhook, { enriched: true, userId: 123 });
     // Seed with a representative body so the variable picker is useful pre-traffic.
     empty.body = { event: "user.created", user: { id: 123, email: "jane@example.com" } };
     empty.headers = { "content-type": "application/json", "x-api-key": "… " };

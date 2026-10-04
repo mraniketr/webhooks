@@ -229,19 +229,20 @@ function sanitizeUser(user){ return {id:user.id,name:user.name,email:user.email,
 function sanitizeWebhook(w){ return {id:w.id,name:w.name,url:`${PUBLIC_BASE}/webhooks/${w.token}`,token:w.token,status:w.status,created_at:w.created_at}; }
 
 function runScript(action, event) {
-  // Pre-action contract: script may assign `output` (any JSON value).
-  // Collected into pre[] and exposed to subscriptions as {{ pre.0 }}, etc.
+  // Single pre-action contract: script may assign `pre` (a key-value object).
+  // Subscriptions access it by key as {{ pre.key }}.
   const logs=[];
   const context={
     event: JSON.parse(JSON.stringify(event)),
-    output: undefined,
+    pre: {},
     log: (...args)=>logs.push(args.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')),
     setStatus: s=>{ context.event.statusOverride=String(s); },
   };
   vm.createContext(context);
   const script = new vm.Script(`"use strict";\n${action.code}`);
   script.runInContext(context,{timeout:500});
-  return {event:context.event, output:context.output, logs};
+  const pre = (context.pre && typeof context.pre === 'object' && !Array.isArray(context.pre)) ? context.pre : {};
+  return {event:context.event, pre, logs};
 }
 
 async function processOneJob() {
@@ -256,8 +257,10 @@ async function processOneJob() {
       id:event.id, webhookId:event.webhook_id, payload:event.payload_json?JSON.parse(event.payload_json):event.raw_body,
       headers:JSON.parse(event.headers_json||'{}'), ip:event.ip, receivedAt:event.received_at
     };
-    for (const a of actions.filter(x=>x.phase==='pre')) {
-      const r=runScript(a, mutableEvent);
+    // Single pre-action only.
+    const preAction = actions.filter(x=>x.phase==='pre')[0];
+    if (preAction) {
+      const r=runScript(preAction, mutableEvent);
       mutableEvent=r.event;
     }
     const override=mutableEvent.statusOverride;
@@ -324,8 +327,8 @@ async function router(req,res) {
     try {
       const b=await readJson(req); const name=String(b.name||'').trim() || 'Untitled webhook';
       const token=randomToken(24); const created=now(); const r=statements.insertWebhook.run(u.id,name,token,created); const id=r.lastInsertRowid;
-      const actions=Array.isArray(b.actions)?b.actions:[];
-      actions.forEach((a,i)=>{ if(!a.code) return; statements.insertAction.run(id,'pre',String(a.name||`Pre-action ${i+1}`),String(a.code),i, a.enabled===false?0:1); });
+      const actions=Array.isArray(b.actions)?b.actions.slice(0,1):[];
+      actions.forEach((a,i)=>{ if(!a.code) return; statements.insertAction.run(id,'pre',String(a.name||`Pre-action`),String(a.code),i, a.enabled===false?0:1); });
       const w=statements.webhookById.get(id,u.id); return json(res,201,{webhook:sanitizeWebhook(w),actions:statements.actionsForWebhook.all(id)});
     } catch(e){ return json(res,e.status||500,{error:e.message}); }
   }

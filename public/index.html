@@ -50,21 +50,21 @@
       </div>
     </section>
     <section id="page-webhooks" class="page hidden">
-      <div class="panel"><div class="panel-head"><div><h3>Endpoints</h3><p>Create isolated webhook URLs with configurable pre-actions.</p></div><button class="primary" id="newWebhookBtn3">＋ New webhook</button></div><div id="webhooksTable" class="table-wrap"></div></div>
+      <div class="panel"><div class="panel-head"><div><h3>Endpoints</h3><p>Create isolated webhook URLs with a pre-action and templated subscriptions.</p></div></div><div id="webhooksTable" class="table-wrap"></div></div>
     </section>
     <section id="page-detail" class="page hidden">
-      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-actions, subscriptions and events.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-action, subscriptions and events.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
     </section>
     <section id="page-edit" class="page hidden">
       <div class="panel"><div class="panel-head"><div><div class="eyebrow" id="editEyebrow">NEW ENDPOINT</div><h3 id="editTitle">Create webhook</h3><p>Configure processing actions and templated subscriptions.</p></div><button class="ghost" id="backToWebhooks">← Back</button></div>
       <form id="webhookForm">
         <div class="field"><label>Webhook name</label><input id="webhookName" placeholder="Stripe events" required/></div>
         <div class="field"><label>Status</label><select id="webhookStatus"><option value="active">active</option><option value="disabled">disabled</option></select></div>
-        <div class="subhead"><span>Pre-actions <small class="muted">JS scripts, run in order — set <code>output = {...}</code> to expose <code>{{ pre.0 }}</code>, <code>{{ pre.1 }}</code> to subscriptions</small></span><button type="button" class="ghost sm" id="addActionBtn">+ Add pre-action</button></div>
+        <div class="subhead"><span>Pre-action <small class="muted">JS script — set <code>pre = {...}</code> to expose <code>{{ pre.key }}</code> to subscriptions</small></span></div>
         <div id="actionRows"></div>
         <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }}, {{ pre }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
         <div id="subList"></div>
-        <div class="callout"><b>Pipeline:</b> event is persisted, pre-actions run (each may set <code>output</code> collected into <code>pre[]</code>), then the payload plus <code>pre[]</code> is forwarded to each enabled subscription. Deliveries are logged per event.</div>
+        <div class="callout"><b>Pipeline:</b> event is persisted, the pre-action runs (it sets a key-value <code>pre</code> object), then the payload plus <code>pre</code> is forwarded to each enabled subscription. Use <code>{{ pre.key }}</code> in subscription URL, headers &amp; JSON. Deliveries are logged per event.</div>
         <div class="modal-actions"><button type="button" class="ghost" id="cancelEdit">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
       </form></div>
     </section>

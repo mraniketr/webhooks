@@ -15,10 +15,10 @@ async function runUserScript(code, event, env, ctx) {
   // LOADER-based implementation.
   //
   // Contract when re-enabled: the script runs with `event` mutable and may
-  // assign `output` (any JSON-serializable value). The returned `output`
-  // becomes one entry in the event's `pre[]` array (index = action order),
-  // exposed to subscriptions as {{ pre.0 }}, {{ pre.0.field }}, etc.
-  return { event, output: undefined, logs: [] };
+  // assign `pre` (a key-value object, e.g. `pre = { userId: ... }`).
+  // The returned `pre` object is stored on the event and exposed to
+  // subscriptions by key as {{ pre.<key> }}.
+  return { event, pre: {}, logs: [] };
 }
 
 async function ensurePreColumn(env) {
@@ -47,9 +47,9 @@ function payloadText(payload) {
   return typeof payload === "string" ? payload : JSON.stringify(payload);
 }
 
-// Main queue: run pre-actions (each may produce an `output` object collected
-// into pre[]), persist the event + pre[], fan out one task per enabled
-// subscription into the delivery queue, ack.
+// Main queue: run the single pre-action (it sets a `pre` key-value object),
+// persist the event + pre, fan out one task per enabled subscription into
+// the delivery queue, ack.
 // Delivery failures never fail this handler — each delivery task carries
 // its own retry budget on the delivery queue.
 async function processEvent(message, env, ctx) {
@@ -73,15 +73,17 @@ async function processEvent(message, env, ctx) {
     receivedAt: row.received_at,
   };
   const logs = [];
-  const pre = [];
+  let pre = {};
 
   try {
-    for (const a of (actions.results || []).filter((x) => x.phase === "pre" || !x.phase)) {
-      const result = await runUserScript(a.code, event, env, ctx);
+    const enabled = (actions.results || []).filter((x) => x.phase === "pre" || !x.phase);
+    const action = enabled[0];
+    if (action) {
+      const result = await runUserScript(action.code, event, env, ctx);
       event = result.event;
       logs.push(...(result.logs || []));
-      // Index-stable: pre[i] corresponds to the i-th enabled pre-action.
-      pre.push(result.output === undefined ? null : result.output);
+      // Single pre-action contract: `pre` must be a key-value object.
+      pre = (result.pre && typeof result.pre === "object" && !Array.isArray(result.pre)) ? result.pre : {};
     }
 
     const preJson = JSON.stringify(pre);

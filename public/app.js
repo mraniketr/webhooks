@@ -111,7 +111,7 @@ async function openEdit(id) {
     $('#webhookName').value = d.webhook.name;
     $('#webhookStatus').value = d.webhook.status || 'active';
     $('#actionRows').innerHTML = '';
-    (d.actions.length ? d.actions : [{}]).forEach(a => $('#actionRows').append(actionRow(a)));
+    $('#actionRows').append(actionRow(d.actions[0] || {}));
     editingSubs = (d.subscriptions || []).map(normalizeSubForEditor);
     renderSubList();
     showPage('edit');
@@ -127,11 +127,10 @@ function cancelEdit() {
 function actionRow(a = {}) {
   const d = document.createElement('div');
   d.className = 'row-card'; d.dataset.id = a.id || '';
-  d.innerHTML = '<div class="row-grid"><input data-k="name" placeholder="Pre-action name" maxlength="100"/><select data-k="enabled"><option value="1">enabled</option><option value="0">disabled</option></select></div><textarea data-k="code" placeholder="// event.payload is available; set output = { ... } to expose as pre[i]"></textarea><div class="row-foot"><span class="muted" style="font-size:11px">pre · output becomes pre[i]</span><button type="button" class="link-danger">Remove</button></div>';
+  d.innerHTML = '<div class="row-grid"><input data-k="name" placeholder="Pre-action name" maxlength="100"/><select data-k="enabled"><option value="1">enabled</option><option value="0">disabled</option></select></div><textarea data-k="code" placeholder="// event.payload is available; set pre = { key: value } to expose {{ pre.key }} to subscriptions"></textarea><div class="row-foot"><span class="muted" style="font-size:11px">single pre-action · <code>pre</code> is a key-value object, subscriptions use <code>{{ pre.key }}</code></span></div>';
   d.querySelector('[data-k="name"]').value = a.name || '';
   d.querySelector('[data-k="enabled"]').value = String(a.enabled ?? 1);
   d.querySelector('[data-k="code"]').value = a.code || '';
-  d.querySelector('.link-danger').onclick = () => d.remove();
   return d;
 }
 
@@ -258,13 +257,13 @@ function fallbackVariables() {
       { variable: '{{ event.id }}', description: 'Event id' },
       { variable: '{{ webhook.name }}', description: 'Webhook name' },
       { variable: '{{ body }}', description: 'Full parsed body' },
-      { variable: '{{ pre }}', description: 'All pre-hook outputs' },
+      { variable: '{{ pre }}', description: 'Key-value object set by the pre-action' },
     ],
     dynamic: [
       { variable: '{{ body.user.id }}', description: 'Field from JSON body' },
       { variable: '{{ headers.x-api-key }}', description: 'Inbound request header' },
       { variable: '{{ query.token }}', description: 'Inbound query param' },
-      { variable: '{{ pre.0 }}', description: 'Output of first pre-hook' },
+      { variable: '{{ pre.key }}', description: 'Value set by the pre-action (use your key)' },
     ],
   };
 }
@@ -295,10 +294,12 @@ function toggleSubVarPanel() {
 }
 
 function collectActions() {
-  return [...$('#actionRows').children].map(c => {
+  // Single pre-action only.
+  const rows = [...$('#actionRows').children].slice(0, 1).map(c => {
     const g = k => c.querySelector('[data-k="' + k + '"]').value;
     return { id: c.dataset.id || undefined, name: g('name').trim(), enabled: g('enabled') !== '0', phase: 'pre', code: g('code') };
   }).filter(o => o.code.trim());
+  return rows.slice(0, 1);
 }
 
 async function previewSingleSubscription() {
@@ -334,8 +335,8 @@ async function persistSubscriptionsAfterSubSave() {
   return api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(payload) });
 }
 
-['#newWebhookBtn', '#newWebhookBtn2', '#newWebhookBtn3'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
-$('#addActionBtn').onclick = () => $('#actionRows').append(actionRow({}));
+['#newWebhookBtn', '#newWebhookBtn2'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
+const addActionBtn = $('#addActionBtn'); if (addActionBtn) addActionBtn.onclick = () => { if (!$('#actionRows').children.length) $('#actionRows').append(actionRow({})); };
 $('#addSubBtn').onclick = () => openSubEditor(-1);
 $('#cancelEdit').onclick = cancelEdit;
 $('#backToWebhooks').onclick = cancelEdit;
@@ -415,7 +416,7 @@ async function openWebhook(id) {
     $('#detailSub').textContent = `${currentWebhook.url} · ${e.total} events`;
     $('#webhookDetail').innerHTML = `<div class="detail-title"><div><div class="url-box"><code>${esc(currentWebhook.url)}</code><button type="button" class="ghost" onclick="copyWebhookUrl()">Copy URL</button></div><div class="curl-box"><div class="curl-head"><span>Test with curl</span><button type="button" class="ghost sm" onclick="copyWebhookCurl()">Copy curl</button></div><pre class="curl-code"><code>${esc(buildCurl(currentWebhook.url))}</code></pre></div></div></div>`
       + `<div class="detail-stats">${[['Total', d.stats.total || 0], ['Processed', d.stats.processed || 0], ['Pending', d.stats.pending || 0], ['Failed', d.stats.failed || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
-      + `<div class="panel-head"><div><h3>Pre-actions</h3><p>Run in order — each may set <code>output</code>, available as <code>{{ pre.i }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? d.actions.map((a, i) => `<div class="action-item"><strong>${esc(a.name)} <span class="muted mono">pre[${i}]</span></strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`).join('') : '<div class="empty">No pre-actions configured.</div>'}</div>`
+      + `<div class="panel-head"><div><h3>Pre-action</h3><p>Sets a key-value <code>pre</code> object — subscriptions use <code>{{ pre.key }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? (() => { const a = d.actions[0]; return `<div class="action-item"><strong>${esc(a.name || 'Pre-action')}</strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`; })() : '<div class="empty">No pre-action configured.</div>'}</div>`
       + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`).join('') : '<div class="empty">No subscriptions — events are stored and processed only.</div>'}</div>`
       + `<div class="panel-head" style="margin-top:18px"><div><h3>Events</h3><p>${e.total} total events</p></div></div><div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>Method</th><th>Status</th><th>Received</th><th>IP</th></tr></thead><tbody>${e.events.map(x => `<tr class="clickable" onclick="viewEvent(${x.id})"><td class="mono">#${x.id}</td><td>${x.method}</td><td><span class="badge ${x.status}">${x.status}</span></td><td>${new Date(x.received_at).toLocaleString()}</td><td class="mono">${esc(x.ip || '—')}</td></tr>`).join('')}</tbody></table></div>`;
   } catch (err) { toast(err.message, true); }
@@ -425,7 +426,7 @@ async function viewEvent(id) {
     const d = await api('/api/events/' + id);
     $('#eventTitle').textContent = `Event #${id} · ${d.event.status}`;
     const e = { ...d.event }; delete e.headers_json; delete e.payload_json; delete e.raw_body; delete e.query_json; delete e.pre_json;
-    $('#eventJson').textContent = JSON.stringify({ id: e.id, webhook: e.webhook_name, status: e.status, receivedAt: e.received_at, processedAt: e.processed_at, ip: e.ip, headers: d.event.headers, query: d.event.query, payload: d.event.payload, pre: d.event.pre || [], error: e.error }, null, 2);
+    $('#eventJson').textContent = JSON.stringify({ id: e.id, webhook: e.webhook_name, status: e.status, receivedAt: e.received_at, processedAt: e.processed_at, ip: e.ip, headers: d.event.headers, query: d.event.query, payload: d.event.payload, pre: d.event.pre || {}, error: e.error }, null, 2);
     const dl = d.deliveries || [];
     $('#eventDeliveries').innerHTML = dl.length ? `<div class="panel-head" style="margin-top:14px"><div><h3>Deliveries</h3><p>${dl.length} subscription attempt${dl.length === 1 ? '' : 's'}</p></div></div><table class="table"><thead><tr><th>Target</th><th>Status</th><th>HTTP</th><th>Attempts</th><th>Error</th></tr></thead><tbody>${dl.map(x => `<tr><td><strong>${esc(x.subscription_name || '—')}</strong><br/><small class="mono">${esc(x.target_url)}</small></td><td><span class="badge ${x.status === 'success' ? 'processed' : 'failed'}">${x.status}</span></td><td class="mono">${x.http_status ?? '—'}</td><td class="mono">${x.attempts}</td><td><small>${esc(x.error || '—')}</small></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No subscription deliveries for this event.</div>';
     $('#eventModal').classList.remove('hidden');

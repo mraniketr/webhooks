@@ -7,9 +7,10 @@
 //
 // Context shape built by buildContext():
 //   { body, headers, query, method, ip, event, webhook, pre }
-// pre is an array: pre[i] is the `output` object produced by the i-th
-// enabled pre-action (in sort order). Subscriptions access it like any
-// other variable, e.g. {{ pre.0.userId }} or {{ pre.0.plan || "free" }}.
+// pre is a key-value object set by the single pre-action
+// (the script assigns `pre = { key: value, ... }`).
+// Subscriptions access it by key, e.g. {{ pre.userId }} or
+// {{ pre.plan || "free" }}.
 
 function getPath(obj, parts) {
   let cur = obj;
@@ -109,6 +110,7 @@ function stringifyForBody(value) {
 
 // Build the template context from a stored event row + webhook row.
 // preOutputs (optional) overrides eventRow.pre_json when provided.
+// pre is always a plain key-value object.
 function buildContext(eventRow, webhookRow, preOutputs) {
   let body = null;
   if (eventRow) {
@@ -123,14 +125,14 @@ function buildContext(eventRow, webhookRow, preOutputs) {
   let query = {};
   try { headers = JSON.parse(eventRow?.headers_json || "{}"); } catch { headers = {}; }
   try { query = JSON.parse(eventRow?.query_json || "{}"); } catch { query = {}; }
-  let pre = [];
+  let pre = {};
   if (preOutputs !== undefined) {
-    pre = Array.isArray(preOutputs) ? preOutputs : [];
+    pre = (preOutputs && typeof preOutputs === "object" && !Array.isArray(preOutputs)) ? preOutputs : {};
   } else if (eventRow && eventRow.pre_json != null) {
     try {
       const parsed = typeof eventRow.pre_json === "string" ? JSON.parse(eventRow.pre_json) : eventRow.pre_json;
-      pre = Array.isArray(parsed) ? parsed : [];
-    } catch { pre = []; }
+      pre = (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
+    } catch { pre = {}; }
   }
   return {
     body,
@@ -184,7 +186,7 @@ function listVariables(ctx) {
     { variable: "{{ webhook.id }}", description: "Webhook id", sample: ctx?.webhook?.id ?? "" },
     { variable: "{{ webhook.name }}", description: "Webhook name", sample: ctx?.webhook?.name ?? "" },
     { variable: "{{ body }}", description: "Full parsed body (object or { _raw })", sample: "" },
-    { variable: "{{ pre }}", description: "All pre-hook outputs (array)", sample: "" },
+    { variable: "{{ pre }}", description: "Key-value object set by the pre-action", sample: "" },
   ];
   const dynamic = [];
   const push = (variable, description, sample) => {
@@ -208,19 +210,16 @@ function listVariables(ctx) {
   if (ctx?.body && typeof ctx.body === "object" && "_raw" in ctx.body) {
     push("{{ body._raw }}", "Raw body (non-JSON payloads)", ctx.body._raw);
   }
-  const pre = (ctx && ctx.pre) || [];
-  if (Array.isArray(pre) && pre.length) {
-    pre.forEach((entry, i) => {
-      push(`{{ pre.${i} }}`, `Output of pre-hook #${i + 1}`, entry);
-      const paths = [];
-      flattenPaths(`pre.${i}`, entry ?? {}, paths);
-      for (const p of paths.slice(0, 20)) {
-        if (p === `pre.${i}`) continue;
-        push(`{{ ${p} }}`, `Field from pre-hook #${i + 1}`, getPath({ pre }, p.split(".")));
-      }
-    });
+  const pre = (ctx && ctx.pre) || {};
+  if (pre && typeof pre === "object" && !Array.isArray(pre) && Object.keys(pre).length) {
+    const paths = [];
+    flattenPaths("pre", pre, paths);
+    for (const p of paths.slice(0, 40)) {
+      if (p === "pre") continue;
+      push(`{{ ${p} }}`, "Field set by the pre-action (by key)", getPath({ pre }, p.split(".")));
+    }
   } else {
-    push("{{ pre.0 }}", "Output of first pre-hook (per event)", "");
+    push("{{ pre.key }}", "Value set by the pre-action (use your key)", "");
   }
   return { base, dynamic };
 }
