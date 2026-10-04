@@ -251,17 +251,59 @@ async function ensureSubscriptionColumns(env) {
   } catch { /* D1 may disallow PRAGMA in some contexts — callers fall back */ }
 }
 
+async function ensureSubscriptionCounterTables(env) {
+  // Best-effort auto-migration for DBs created before subscription counters.
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_counters (
+      subscription_id INTEGER PRIMARY KEY,
+      webhook_id INTEGER NOT NULL,
+      enqueued INTEGER NOT NULL DEFAULT 0,
+      delivered_ok INTEGER NOT NULL DEFAULT 0,
+      delivered_failed INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_daily_counters (
+      subscription_id INTEGER NOT NULL,
+      day TEXT NOT NULL,
+      enqueued INTEGER NOT NULL DEFAULT 0,
+      delivered_ok INTEGER NOT NULL DEFAULT 0,
+      delivered_failed INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (subscription_id, day),
+      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+    )`).run();
+  } catch { /* ignore — readers fall back to zeros */ }
+}
+
 async function saveSubscriptions(env, wid, subs) {
   await ensureSubscriptionColumns(env);
+  await ensureSubscriptionCounterTables(env);
+  // Remove counters for subscriptions about to be replaced (FK cascade may
+  // be off if PRAGMA foreign_keys was never enabled on this connection).
+  try {
+    await env.DB.prepare(`DELETE FROM subscription_counters WHERE webhook_id=?`).bind(wid).run();
+    await env.DB.prepare(`DELETE FROM subscription_daily_counters WHERE subscription_id NOT IN (SELECT id FROM subscriptions)`).run();
+  } catch { /* counters table may not exist on very old DBs — created above */ }
   await env.DB.prepare("DELETE FROM subscriptions WHERE webhook_id=?").bind(wid).run();
   const created = now();
   for (const s of subs) {
+    let subId = 0;
     try {
-      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
         .bind(wid, s.name, s.target_url, s.secret, s.enabled, s.http_method || "POST", s.headers_json || null, s.payload_mode || "passthrough", s.payload_template || null, created).run();
+      subId = Number(r.meta.last_row_id) || 0;
     } catch {
-      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+      const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
         .bind(wid, s.name, s.target_url, s.secret, s.enabled, created).run();
+      subId = Number(r.meta.last_row_id) || 0;
+    }
+    if (subId) {
+      try {
+        await env.DB.prepare("INSERT OR IGNORE INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at) VALUES (?,?,?,?,?,?)")
+          .bind(subId, wid, 0, 0, 0, now()).run();
+      } catch { /* ignore */ }
     }
   }
 }
@@ -269,6 +311,9 @@ async function saveSubscriptions(env, wid, subs) {
 function subscriptionView(s) {
   let headers = {};
   try { headers = parseHeadersJson(s.headers_json ?? s.headers ?? {}); } catch { headers = {}; }
+  const enqueued = Number(s.enqueued ?? 0);
+  const deliveredOk = Number(s.delivered_ok ?? 0);
+  const deliveredFailed = Number(s.delivered_failed ?? 0);
   return {
     id: s.id, name: s.name, target_url: s.target_url, enabled: s.enabled, created_at: s.created_at,
     has_secret: s.has_secret ?? (s.secret ? 1 : 0),
@@ -277,20 +322,32 @@ function subscriptionView(s) {
     headers_json: s.headers_json ?? null,
     payload_mode: s.payload_mode || "passthrough",
     payload_template: s.payload_template ?? null,
+    stats: { enqueued, delivered_ok: deliveredOk, delivered_failed: deliveredFailed,
+      pending: Math.max(0, enqueued - deliveredOk - deliveredFailed) },
+    enqueued, delivered_ok: deliveredOk, delivered_failed: deliveredFailed,
   };
 }
 
 async function webhookRelations(env, wid) {
   const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? AND phase='pre' ORDER BY sort_order,id").bind(wid).all();
+  await ensureSubscriptionCounterTables(env);
   let subscriptions;
   try {
-    subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,http_method,headers_json,payload_mode,payload_template,
-      CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
-      FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+    subscriptions = await env.DB.prepare(`SELECT s.id,s.name,s.target_url,s.enabled,s.created_at,s.http_method,s.headers_json,s.payload_mode,s.payload_template,
+      CASE WHEN s.secret IS NOT NULL AND s.secret != '' THEN 1 ELSE 0 END AS has_secret,
+      COALESCE(c.enqueued,0) enqueued, COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
+      FROM subscriptions s LEFT JOIN subscription_counters c ON c.subscription_id=s.id
+      WHERE s.webhook_id=? ORDER BY s.id`).bind(wid).all();
   } catch {
-    subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
-      CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
-      FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+    try {
+      subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,http_method,headers_json,payload_mode,payload_template,
+        CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
+        FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+    } catch {
+      subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
+        CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
+        FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+    }
   }
   return { actions: actions.results, subscriptions: (subscriptions.results || []).map(subscriptionView) };
 }
@@ -298,7 +355,10 @@ async function webhookRelations(env, wid) {
 async function mergeSubscriptions(env, wid, input) {
   // Update in place when an id matches (preserves the signing secret when
   // the client leaves it blank); insert new rows; delete removed rows.
+  // Per-subscription counters are preserved on update, seeded on insert,
+  // and removed with the subscription on delete.
   await ensureSubscriptionColumns(env);
+  await ensureSubscriptionCounterTables(env);
   const current = await env.DB.prepare("SELECT * FROM subscriptions WHERE webhook_id=?").bind(wid).all();
   const byId = new Map(current.results.map((s) => [s.id, s]));
   const seen = new Set();
@@ -319,19 +379,34 @@ async function mergeSubscriptions(env, wid, input) {
           .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled, id).run();
       }
     } else {
+      let newId = 0;
       try {
-        await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
           .bind(wid, item.name, item.target_url, item.secret || null, item.enabled,
             item.http_method || "POST", item.headers_json || null, item.payload_mode || "passthrough",
             item.payload_mode === "custom" ? (item.payload_template || null) : null, now()).run();
+        newId = Number(r.meta.last_row_id) || 0;
       } catch {
-        await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
           .bind(wid, item.name, item.target_url, item.secret || null, item.enabled, now()).run();
+        newId = Number(r.meta.last_row_id) || 0;
+      }
+      if (newId) {
+        try {
+          await env.DB.prepare("INSERT OR IGNORE INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at) VALUES (?,?,?,?,?,?)")
+            .bind(newId, wid, 0, 0, 0, now()).run();
+        } catch { /* ignore */ }
       }
     }
   }
   for (const s of current.results) {
-    if (!seen.has(s.id)) await env.DB.prepare("DELETE FROM subscriptions WHERE id=?").bind(s.id).run();
+    if (!seen.has(s.id)) {
+      await env.DB.prepare("DELETE FROM subscriptions WHERE id=?").bind(s.id).run();
+      try {
+        await env.DB.prepare("DELETE FROM subscription_counters WHERE subscription_id=?").bind(s.id).run();
+        await env.DB.prepare("DELETE FROM subscription_daily_counters WHERE subscription_id=?").bind(s.id).run();
+      } catch { /* ignore */ }
+    }
   }
 }
 

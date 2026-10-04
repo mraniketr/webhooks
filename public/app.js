@@ -89,6 +89,7 @@ function normalizePreForEditor(a = {}) {
 function normalizeSubForEditor(s = {}) {
   let headers = s.headers && typeof s.headers === 'object' ? s.headers
     : (() => { try { return JSON.parse(s.headers_json || '{}'); } catch { return {}; } })();
+  const stats = s.stats || {};
   return {
     id: s.id || undefined,
     name: s.name || '',
@@ -100,6 +101,12 @@ function normalizeSubForEditor(s = {}) {
     headers: headers || {},
     payload_mode: s.payload_mode || 'passthrough',
     payload_template: s.payload_template || '',
+    stats: {
+      enqueued: Number(stats.enqueued ?? s.enqueued ?? 0),
+      delivered_ok: Number(stats.delivered_ok ?? s.delivered_ok ?? 0),
+      delivered_failed: Number(stats.delivered_failed ?? s.delivered_failed ?? 0),
+      pending: Number(stats.pending ?? Math.max(0, Number(stats.enqueued ?? s.enqueued ?? 0) - Number(stats.delivered_ok ?? s.delivered_ok ?? 0) - Number(stats.delivered_failed ?? s.delivered_failed ?? 0))),
+    },
   };
 }
 function openCreate() {
@@ -200,11 +207,14 @@ function renderSubList() {
   box.innerHTML = '';
   editingSubs.forEach((s, i) => {
     const hdrCount = s.headers ? Object.keys(s.headers).length : 0;
+    const st = s.stats || {};
+    const statBits = `${st.enqueued ?? 0} queued · ${st.delivered_ok ?? 0} ok · ${st.delivered_failed ?? 0} failed`;
     const row = document.createElement('div');
     row.className = 'hook-row sub-list-row';
     row.innerHTML = `<div><strong>${esc(s.name || s.target_url || 'Untitled subscription')}</strong>`
       + `<small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url || '—')}</small>`
-      + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}</small></div>`
+      + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}</small>`
+      + `<small class="mono">${esc(statBits)}</small></div>`
       + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
     row.querySelector('button').onclick = () => openSubEditor(i);
     box.append(row);
@@ -270,6 +280,7 @@ function collectSubEditor() {
     headers,
     payload_mode: mode,
     payload_template: mode === 'custom' ? $('#subPayloadTemplate').value : '',
+    stats: prev.stats || { enqueued: 0, delivered_ok: 0, delivered_failed: 0, pending: 0 },
   };
 }
 
@@ -401,10 +412,10 @@ $('#subEditForm').onsubmit = async e => {
   if (!draft.target_url) { toast('Target URL is required', true); return; }
   try {
     if (editingSubIndex === -1) {
-      editingSubs.push({ ...draft, secret: draft.secret || '', has_secret: draft.secret ? 1 : 0 });
+      editingSubs.push({ ...draft, secret: draft.secret || '', has_secret: draft.secret ? 1 : 0, stats: draft.stats || { enqueued: 0, delivered_ok: 0, delivered_failed: 0, pending: 0 } });
     } else {
       const prev = editingSubs[editingSubIndex] || {};
-      editingSubs[editingSubIndex] = { ...draft, id: prev.id, has_secret: draft.secret ? 1 : (prev.has_secret || 0) };
+      editingSubs[editingSubIndex] = { ...draft, id: prev.id, has_secret: draft.secret ? 1 : (prev.has_secret || 0), stats: prev.stats || draft.stats };
     }
     if (editingId) {
       const saved = await persistSubscriptionsAfterSubSave();
@@ -477,7 +488,7 @@ async function openWebhook(id) {
     $('#webhookDetail').innerHTML = `<div class="detail-title"><div><div class="url-box"><code>${esc(currentWebhook.url)}</code><button type="button" class="ghost" onclick="copyWebhookUrl()">Copy URL</button></div><div class="curl-box"><div class="curl-head"><span>Test with curl</span><button type="button" class="ghost sm" onclick="copyWebhookCurl()">Copy curl</button></div><pre class="curl-code"><code>${esc(buildCurl(currentWebhook.url))}</code></pre></div></div></div>`
       + `<div class="detail-stats">${[['Received', d.stats.total || 0], ['Processed', d.stats.processed || 0], ['Delivered', d.stats.delivered_ok || 0], ['Failed', d.stats.failed || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
       + `<div class="panel-head"><div><h3>Pre-action</h3><p>Sets a key-value <code>pre</code> object — subscriptions use <code>{{ pre.key }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? (() => { const a = d.actions[0]; return `<div class="action-item"><strong>${esc(a.name || 'Pre-action')}</strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`; })() : '<div class="empty">No pre-action configured.</div>'}</div>`
-      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => { const st = s.stats || {}; const enq = st.enqueued ?? s.enqueued ?? 0; const ok = st.delivered_ok ?? s.delivered_ok ?? 0; const fail = st.delivered_failed ?? s.delivered_failed ?? 0; return `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small><small class="mono">${enq} queued · ${ok} delivered · ${fail} failed</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`; }).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
   } catch (err) { toast(err.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }

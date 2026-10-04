@@ -73,3 +73,31 @@ CREATE TABLE IF NOT EXISTS webhook_daily_counters (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_counters_day ON webhook_daily_counters(day);
+
+-- Per-subscription delivery stats (subscription-level analytics).
+-- received/processed stay webhook-level (ingest + pre-action); delivery
+-- outcomes (enqueued / delivered_ok / delivered_failed) are tracked here.
+CREATE TABLE IF NOT EXISTS subscription_counters (
+  subscription_id INTEGER PRIMARY KEY,
+  webhook_id INTEGER NOT NULL,
+  enqueued INTEGER NOT NULL DEFAULT 0,
+  delivered_ok INTEGER NOT NULL DEFAULT 0,
+  delivered_failed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS subscription_daily_counters (
+  subscription_id INTEGER NOT NULL,
+  day TEXT NOT NULL,
+  enqueued INTEGER NOT NULL DEFAULT 0,
+  delivered_ok INTEGER NOT NULL DEFAULT 0,
+  delivered_failed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (subscription_id, day),
+  FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_counters_webhook ON subscription_counters(webhook_id);
+CREATE INDEX IF NOT EXISTS idx_sub_daily_day ON subscription_daily_counters(day);

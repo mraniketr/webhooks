@@ -35,8 +35,10 @@ function rowFromMessage(msg, pre) {
   };
 }
 
-function analyticsMsg(webhookId, field, count = 1, at = now()) {
-  return { webhookId: Number(webhookId), field, count, day: dayOf(at) };
+function analyticsMsg(webhookId, field, count = 1, at = now(), subscriptionId = null) {
+  const msg = { webhookId: Number(webhookId), field, count, day: dayOf(at) };
+  if (subscriptionId != null && Number(subscriptionId)) msg.subscriptionId = Number(subscriptionId);
+  return msg;
 }
 
 async function emitAnalytics(env, msg) {
@@ -50,6 +52,7 @@ async function emitAnalytics(env, msg) {
       level: "error",
       msg: "analytics enqueue failed",
       webhookId: msg.webhookId,
+      subscriptionId: msg.subscriptionId ?? null,
       field: msg.field,
       error: error?.message || String(error),
     }));
@@ -109,6 +112,8 @@ async function processEvent(message, env, ctx) {
       receivedAt: msg.receivedAt || now(),
       pre,
     });
+    // Subscription-level stat: one task enqueued for this subscription.
+    await emitAnalytics(env, analyticsMsg(webhookId, "enqueued", 1, msg.receivedAt, sub.id));
   }
 
   await emitAnalytics(env, analyticsMsg(webhookId, "processed", 1, msg.receivedAt));
@@ -154,7 +159,7 @@ async function processDelivery(message, env, ctx) {
 
   if (!rendered.url) {
     const err = rendered.errors[0] || "Subscription template rendered an empty URL";
-    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt));
+    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt, subscriptionId));
     logEventStatus({
       msg: "delivery failed", status: "failed",
       eventId, webhookId, subscriptionId,
@@ -193,7 +198,7 @@ async function processDelivery(message, env, ctx) {
   }
 
   if (outcome.ok) {
-    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_ok", 1, msg.receivedAt));
+    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_ok", 1, msg.receivedAt, subscriptionId));
     logEventStatus({
       msg: "delivery ok", status: "success",
       eventId, webhookId, subscriptionId,
@@ -201,7 +206,7 @@ async function processDelivery(message, env, ctx) {
     });
     return;
   }
-  await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt));
+  await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt, subscriptionId));
   logEventStatus({
     msg: "delivery failed", status: "failed",
     eventId, webhookId, subscriptionId,
@@ -222,24 +227,45 @@ async function hmacHex(secret, bodyText) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const ANALYTICS_FIELDS = new Set(["received", "processed", "delivered_ok", "delivered_failed"]);
+const ANALYTICS_FIELDS = new Set(["received", "processed", "enqueued", "delivered_ok", "delivered_failed"]);
+// Webhook-level rollup keeps all fields (delivered_* summed across
+// subscriptions so existing dashboard totals keep working); per-subscription
+// rows track only delivery fields.
+const SUBSCRIPTION_FIELDS = new Set(["enqueued", "delivered_ok", "delivered_failed"]);
+const WEBHOOK_FIELDS = new Set(["received", "processed", "delivered_ok", "delivered_failed"]);
 
 // Analytics queue: the ONLY writer of aggregate counters. Batches collapse
-// N messages into one UPSERT per (webhook, day), so hot-path throughput
-// never translates into per-event D1 writes.
+// N messages into one UPSERT per (webhook, day) plus one UPSERT per
+// (subscription, day), so hot-path throughput never translates into
+// per-event D1 writes.
 async function processAnalyticsBatch(messages, env) {
+  await ensureSubscriptionCounterTables(env);
   // Accumulate {webhookId -> {day -> {field -> count}}}
   const acc = new Map();
+  // Accumulate {"subId|day" -> {subscriptionId, webhookId, day, counts}}
+  const subAcc = new Map();
   for (const m of messages) {
     const b = m.body || {};
     const webhookId = Number(b.webhookId);
     if (!webhookId || !ANALYTICS_FIELDS.has(b.field)) continue;
     const day = String(b.day || dayOf(now()));
     const count = Math.max(1, Math.min(10000, Number(b.count) || 1));
+    const subscriptionId = b.subscriptionId != null ? Number(b.subscriptionId) : 0;
     if (!acc.has(webhookId)) acc.set(webhookId, new Map());
     const byDay = acc.get(webhookId);
     if (!byDay.has(day)) byDay.set(day, { received: 0, processed: 0, delivered_ok: 0, delivered_failed: 0 });
-    byDay.get(day)[b.field] += count;
+    // Webhook rollup: `enqueued` is subscription-only, everything else rolls up.
+    if (WEBHOOK_FIELDS.has(b.field)) {
+      byDay.get(day)[b.field] += count;
+    } else if (b.field === "enqueued" && !subscriptionId) {
+      // Legacy sender without subscriptionId — nothing to roll up; skip.
+    }
+    // Subscription-level: delivery fields with a subscription id.
+    if (subscriptionId && SUBSCRIPTION_FIELDS.has(b.field)) {
+      const key = `${subscriptionId}|${day}`;
+      if (!subAcc.has(key)) subAcc.set(key, { subscriptionId, webhookId, day, enqueued: 0, delivered_ok: 0, delivered_failed: 0 });
+      subAcc.get(key)[b.field] += count;
+    }
   }
   const ts = now();
   for (const [webhookId, byDay] of acc) {
@@ -266,6 +292,52 @@ async function processAnalyticsBatch(messages, env) {
       ).bind(webhookId, day, c.received, c.processed, c.delivered_ok, c.delivered_failed, ts).run();
     }
   }
+  for (const entry of subAcc.values()) {
+    await env.DB.prepare(
+      `INSERT INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(subscription_id) DO UPDATE SET
+         enqueued=enqueued+excluded.enqueued,
+         delivered_ok=delivered_ok+excluded.delivered_ok,
+         delivered_failed=delivered_failed+excluded.delivered_failed,
+         updated_at=excluded.updated_at`
+    ).bind(entry.subscriptionId, entry.webhookId, entry.enqueued, entry.delivered_ok, entry.delivered_failed, ts).run();
+    await env.DB.prepare(
+      `INSERT INTO subscription_daily_counters (subscription_id, day, enqueued, delivered_ok, delivered_failed, updated_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(subscription_id, day) DO UPDATE SET
+         enqueued=enqueued+excluded.enqueued,
+         delivered_ok=delivered_ok+excluded.delivered_ok,
+         delivered_failed=delivered_failed+excluded.delivered_failed,
+         updated_at=excluded.updated_at`
+    ).bind(entry.subscriptionId, entry.day, entry.enqueued, entry.delivered_ok, entry.delivered_failed, ts).run();
+  }
+}
+
+async function ensureSubscriptionCounterTables(env) {
+  // Best-effort auto-migration for DBs created before subscription counters.
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_counters (
+      subscription_id INTEGER PRIMARY KEY,
+      webhook_id INTEGER NOT NULL,
+      enqueued INTEGER NOT NULL DEFAULT 0,
+      delivered_ok INTEGER NOT NULL DEFAULT 0,
+      delivered_failed INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_daily_counters (
+      subscription_id INTEGER NOT NULL,
+      day TEXT NOT NULL,
+      enqueued INTEGER NOT NULL DEFAULT 0,
+      delivered_ok INTEGER NOT NULL DEFAULT 0,
+      delivered_failed INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (subscription_id, day),
+      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+    )`).run();
+  } catch { /* ignore — next batch retries */ }
 }
 
 async function processAnalytics(message, env, ctx) {
