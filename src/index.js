@@ -250,9 +250,9 @@ export default {
 
         if (request.method === "GET" && p === "/api/dashboard") {
           const stats = await env.DB.prepare(`SELECT COUNT(*) total,
-            SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) processed,
-            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
-            SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) pending
+            SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
+            SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) failed,
+            SUM(CASE WHEN e.status='accepted' THEN 1 ELSE 0 END) pending
             FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE w.user_id=?`).bind(user.id).first();
           const hooks = await env.DB.prepare(`SELECT w.*, COUNT(e.id) events,
             SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
