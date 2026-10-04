@@ -116,8 +116,6 @@ async function processEvent(message, env, ctx) {
     await emitAnalytics(env, analyticsMsg(webhookId, "enqueued", 1, msg.receivedAt, sub.id));
   }
 
-  await emitAnalytics(env, analyticsMsg(webhookId, "processed", 1, msg.receivedAt));
-
   logEventStatus({
     msg: "event processed",
     status: "processed",
@@ -227,71 +225,27 @@ async function hmacHex(secret, bodyText) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const ANALYTICS_FIELDS = new Set(["received", "processed", "enqueued", "delivered_ok", "delivered_failed"]);
-// Webhook-level rollup keeps all fields (delivered_* summed across
-// subscriptions so existing dashboard totals keep working); per-subscription
-// rows track only delivery fields.
-const SUBSCRIPTION_FIELDS = new Set(["enqueued", "delivered_ok", "delivered_failed"]);
-const WEBHOOK_FIELDS = new Set(["received", "processed", "delivered_ok", "delivered_failed"]);
+const ANALYTICS_FIELDS = new Set(["enqueued", "delivered_ok", "delivered_failed"]);
 
 // Analytics queue: the ONLY writer of aggregate counters. Batches collapse
-// N messages into one UPSERT per (webhook, day) plus one UPSERT per
-// (subscription, day), so hot-path throughput never translates into
-// per-event D1 writes.
+// N messages into one UPSERT per (subscription, day), so hot-path throughput
+// never translates into per-event D1 writes. All stats are subscription-level.
 async function processAnalyticsBatch(messages, env) {
   await ensureSubscriptionCounterTables(env);
-  // Accumulate {webhookId -> {day -> {field -> count}}}
-  const acc = new Map();
   // Accumulate {"subId|day" -> {subscriptionId, webhookId, day, counts}}
   const subAcc = new Map();
   for (const m of messages) {
     const b = m.body || {};
     const webhookId = Number(b.webhookId);
-    if (!webhookId || !ANALYTICS_FIELDS.has(b.field)) continue;
+    const subscriptionId = b.subscriptionId != null ? Number(b.subscriptionId) : 0;
+    if (!webhookId || !subscriptionId || !ANALYTICS_FIELDS.has(b.field)) continue;
     const day = String(b.day || dayOf(now()));
     const count = Math.max(1, Math.min(10000, Number(b.count) || 1));
-    const subscriptionId = b.subscriptionId != null ? Number(b.subscriptionId) : 0;
-    if (!acc.has(webhookId)) acc.set(webhookId, new Map());
-    const byDay = acc.get(webhookId);
-    if (!byDay.has(day)) byDay.set(day, { received: 0, processed: 0, delivered_ok: 0, delivered_failed: 0 });
-    // Webhook rollup: `enqueued` is subscription-only, everything else rolls up.
-    if (WEBHOOK_FIELDS.has(b.field)) {
-      byDay.get(day)[b.field] += count;
-    } else if (b.field === "enqueued" && !subscriptionId) {
-      // Legacy sender without subscriptionId — nothing to roll up; skip.
-    }
-    // Subscription-level: delivery fields with a subscription id.
-    if (subscriptionId && SUBSCRIPTION_FIELDS.has(b.field)) {
-      const key = `${subscriptionId}|${day}`;
-      if (!subAcc.has(key)) subAcc.set(key, { subscriptionId, webhookId, day, enqueued: 0, delivered_ok: 0, delivered_failed: 0 });
-      subAcc.get(key)[b.field] += count;
-    }
+    const key = `${subscriptionId}|${day}`;
+    if (!subAcc.has(key)) subAcc.set(key, { subscriptionId, webhookId, day, enqueued: 0, delivered_ok: 0, delivered_failed: 0 });
+    subAcc.get(key)[b.field] += count;
   }
   const ts = now();
-  for (const [webhookId, byDay] of acc) {
-    for (const [day, c] of byDay) {
-      await env.DB.prepare(
-        `INSERT INTO webhook_counters (webhook_id, received, processed, delivered_ok, delivered_failed, updated_at)
-         VALUES (?,?,?,?,?,?)
-         ON CONFLICT(webhook_id) DO UPDATE SET
-           received=received+excluded.received,
-           processed=processed+excluded.processed,
-           delivered_ok=delivered_ok+excluded.delivered_ok,
-           delivered_failed=delivered_failed+excluded.delivered_failed,
-           updated_at=excluded.updated_at`
-      ).bind(webhookId, c.received, c.processed, c.delivered_ok, c.delivered_failed, ts).run();
-      await env.DB.prepare(
-        `INSERT INTO webhook_daily_counters (webhook_id, day, received, processed, delivered_ok, delivered_failed, updated_at)
-         VALUES (?,?,?,?,?,?,?)
-         ON CONFLICT(webhook_id, day) DO UPDATE SET
-           received=received+excluded.received,
-           processed=processed+excluded.processed,
-           delivered_ok=delivered_ok+excluded.delivered_ok,
-           delivered_failed=delivered_failed+excluded.delivered_failed,
-           updated_at=excluded.updated_at`
-      ).bind(webhookId, day, c.received, c.processed, c.delivered_ok, c.delivered_failed, ts).run();
-    }
-  }
   for (const entry of subAcc.values()) {
     await env.DB.prepare(
       `INSERT INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at)

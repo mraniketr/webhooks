@@ -154,13 +154,26 @@ async function apiJson(user, env, ttlMs, body, status = 200) {
 }
 
 function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at }; }
-// Aggregate-only analytics: counts come from webhook_counters (maintained
-// async by the analytics queue), never from per-event rows.
+// Subscription-level analytics only: counts come from subscription_counters
+// (maintained async by the analytics queue), never from per-event rows.
+// Webhooks carry no counters of their own.
 function webhookView(w, request) {
   return { id: w.id, name: w.name, token: w.token, status: w.status, created_at: w.created_at,
-    events: Number(w.received ?? 0), processed: Number(w.processed ?? 0), failed: Number(w.delivered_failed ?? 0),
-    delivered_ok: Number(w.delivered_ok ?? 0),
+    subscription_count: Number(w.subscription_count ?? 0),
+    enqueued: Number(w.enqueued ?? 0), delivered_ok: Number(w.delivered_ok ?? 0), delivered_failed: Number(w.delivered_failed ?? 0),
     url: `${new URL(request.url).origin}/webhooks/${w.token}` };
+}
+
+// Sum per-subscription counters into a webhook-level aggregate for display.
+function sumSubscriptionStats(subs) {
+  let enqueued = 0, ok = 0, failed = 0;
+  for (const s of subs || []) {
+    const st = s.stats || s;
+    enqueued += Number(st.enqueued ?? 0);
+    ok += Number(st.delivered_ok ?? 0);
+    failed += Number(st.delivered_failed ?? 0);
+  }
+  return { enqueued, delivered_ok: ok, delivered_failed: failed, pending: Math.max(0, enqueued - ok - failed) };
 }
 
 function emptySampleContext() {
@@ -587,29 +600,40 @@ export default {
         }
 
         if (request.method === "GET" && p === "/api/dashboard") {
-          // Aggregate-only: totals from webhook_counters. Per-event history
-          // lives in worker logs (observability), not in D1.
+          // Subscription-level analytics only: totals are summed across the
+          // user's subscription_counters. Per-event history lives in worker
+          // logs (observability), not in D1.
+          await ensureSubscriptionCounterTables(env);
           const sums = await env.DB.prepare(`SELECT
-            COALESCE(SUM(c.received),0) received,
-            COALESCE(SUM(c.processed),0) processed,
+            COALESCE(SUM(c.enqueued),0) enqueued,
             COALESCE(SUM(c.delivered_ok),0) delivered_ok,
             COALESCE(SUM(c.delivered_failed),0) delivered_failed
-            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=?`).bind(user.id).first().catch(() => null);
+            FROM subscriptions s JOIN webhooks w ON w.id=s.webhook_id
+            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
+            WHERE w.user_id=?`).bind(user.id).first().catch(() => null);
           const hooks = await env.DB.prepare(`SELECT w.*,
-            COALESCE(c.received,0) received, COALESCE(c.processed,0) processed,
-            COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
-            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
-          const received = Number(sums?.received || 0), processed = Number(sums?.processed || 0);
-          const failed = Number(sums?.delivered_failed || 0);
-          return apiJson(user, env, ttlMs, { stats: { total: received, processed, failed, pending: Math.max(0, received - processed), delivered_ok: Number(sums?.delivered_ok || 0) },
+            COUNT(DISTINCT s.id) subscription_count,
+            COALESCE(SUM(c.enqueued),0) enqueued,
+            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
+            COALESCE(SUM(c.delivered_failed),0) delivered_failed
+            FROM webhooks w LEFT JOIN subscriptions s ON s.webhook_id=w.id
+            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
+            WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
+          const enqueued = Number(sums?.enqueued || 0), ok = Number(sums?.delivered_ok || 0), failed = Number(sums?.delivered_failed || 0);
+          return apiJson(user, env, ttlMs, { stats: { enqueued, delivered_ok: ok, delivered_failed: failed, pending: Math.max(0, enqueued - ok - failed) },
             webhooks: hooks.results.map(w => webhookView(w, request)) });
         }
 
         if (request.method === "GET" && p === "/api/webhooks") {
+          await ensureSubscriptionCounterTables(env);
           const rows = await env.DB.prepare(`SELECT w.*,
-            COALESCE(c.received,0) received, COALESCE(c.processed,0) processed,
-            COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
-            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
+            COUNT(DISTINCT s.id) subscription_count,
+            COALESCE(SUM(c.enqueued),0) enqueued,
+            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
+            COALESCE(SUM(c.delivered_failed),0) delivered_failed
+            FROM webhooks w LEFT JOIN subscriptions s ON s.webhook_id=w.id
+            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
+            WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
           return apiJson(user, env, ttlMs, { webhooks: rows.results.map(w => webhookView(w, request)) });
         }
 
@@ -657,14 +681,31 @@ export default {
           const wid = Number(hookIdMatch[1]);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           if (!w) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const stats = await env.DB.prepare(`SELECT COALESCE(received,0) received, COALESCE(processed,0) processed,
-            COALESCE(delivered_ok,0) delivered_ok, COALESCE(delivered_failed,0) delivered_failed
-            FROM webhook_counters WHERE webhook_id=?`).bind(wid).first().catch(() => null);
           const rel = await webhookRelations(env, wid);
-          const received = Number(stats?.received || 0), processed = Number(stats?.processed || 0);
-          return apiJson(user, env, ttlMs, { webhook: webhookView({ ...w, received, processed, delivered_ok: Number(stats?.delivered_ok || 0), delivered_failed: Number(stats?.delivered_failed || 0) }, request),
-            stats: { total: received, processed, failed: Number(stats?.delivered_failed || 0), pending: Math.max(0, received - processed), delivered_ok: Number(stats?.delivered_ok || 0) },
+          const stats = sumSubscriptionStats(rel.subscriptions);
+          return apiJson(user, env, ttlMs, { webhook: webhookView({ ...w, subscription_count: rel.subscriptions.length, ...stats }, request),
+            stats,
             actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+        }
+
+        const subIdMatch = p.match(/^\/api\/subscriptions\/(\d+)$/);
+        if (request.method === "GET" && subIdMatch) {
+          // Single subscription with its own counters + per-day breakdown.
+          const sid = Number(subIdMatch[1]);
+          await ensureSubscriptionCounterTables(env);
+          const sub = await env.DB.prepare(`SELECT s.*,
+            CASE WHEN s.secret IS NOT NULL AND s.secret != '' THEN 1 ELSE 0 END AS has_secret,
+            COALESCE(c.enqueued,0) enqueued, COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
+            FROM subscriptions s LEFT JOIN subscription_counters c ON c.subscription_id=s.id
+            WHERE s.id=?`).bind(sid).first().catch(() => null);
+          if (!sub) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+          const owns = await env.DB.prepare("SELECT id,name,token,status FROM webhooks WHERE id=? AND user_id=?").bind(sub.webhook_id, user.id).first();
+          if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+          const daily = await env.DB.prepare(`SELECT day,enqueued,delivered_ok,delivered_failed,updated_at
+            FROM subscription_daily_counters WHERE subscription_id=? ORDER BY day DESC LIMIT 30`).bind(sid).all().catch(() => ({ results: [] }));
+          return apiJson(user, env, ttlMs, { subscription: subscriptionView(sub),
+            webhook: webhookView({ ...owns, subscription_count: 0 }, request),
+            daily: daily.results || [] });
         }
 
         const contextMatch = p.match(/^\/api\/webhooks\/(\d+)\/context$/);
@@ -718,8 +759,8 @@ export default {
         const payload = parsePayload(request, raw);
         const received = now();
         // No D1 write on ingest — the event travels in the queue message.
-        // Status is observed via structured worker logs; counts accumulate
-        // async through the analytics queue (ctx.waitUntil, off the hot path).
+        // Delivery stats are subscription-level and accumulate async through
+        // the analytics queue (off the hot path).
         const eventId = crypto.randomUUID();
         const eventMessage = {
           eventId,
@@ -733,18 +774,6 @@ export default {
           receivedAt: received,
         };
         await env.WEBHOOK_QUEUE.send(eventMessage);
-        ctx.waitUntil((async () => {
-          try {
-            if (env.ANALYTICS_QUEUE) {
-              await env.ANALYTICS_QUEUE.send({
-                webhookId: hook.id, field: "received", count: 1,
-                day: received.slice(0, 10),
-              });
-            }
-          } catch (e) {
-            console.error(JSON.stringify({ level: "error", msg: "analytics enqueue failed", webhookId: hook.id, error: e?.message || String(e) }));
-          }
-        })());
         return json({ accepted: true, eventId, status: "queued" }, 202);
       }
 

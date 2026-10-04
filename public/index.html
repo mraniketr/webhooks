@@ -48,7 +48,10 @@
       <div class="panel"><div class="panel-head"><div><h3>All Webhooks</h3><p>Create isolated webhook URLs with a pre-action and templated subscriptions.</p></div></div><div id="webhooksTable" class="table-wrap"></div></div>
     </section>
     <section id="page-detail" class="page hidden">
-      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-action, subscriptions and aggregate counts.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-action and subscriptions.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
+    </section>
+    <section id="page-subscription" class="page hidden">
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow">SUBSCRIPTION</div><h3 id="subDetailName">Subscription</h3><p id="subDetailSub">Delivery stats and configuration.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToWebhookBtn">← Back to webhook</button><button class="ghost" id="subDetailEditBtn">Edit</button></div></div><div id="subscriptionDetail"></div></div>
     </section>
     <section id="page-edit" class="page hidden">
       <div class="panel"><div class="panel-head"><div><div class="eyebrow" id="editEyebrow">NEW ENDPOINT</div><h3 id="editTitle">Create webhook</h3><p>Configure processing actions and templated subscriptions.</p></div><button class="ghost" id="backToWebhooks">← Back</button></div>

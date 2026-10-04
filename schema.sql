@@ -48,35 +48,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_webhook ON subscriptions(webhook_id);
 
--- Aggregate-only analytics (hot path writes nothing per-event; the
--- analytics queue consumer UPSERTs here async).
-CREATE TABLE IF NOT EXISTS webhook_counters (
-  webhook_id INTEGER PRIMARY KEY,
-  received INTEGER NOT NULL DEFAULT 0,
-  processed INTEGER NOT NULL DEFAULT 0,
-  delivered_ok INTEGER NOT NULL DEFAULT 0,
-  delivered_failed INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS webhook_daily_counters (
-  webhook_id INTEGER NOT NULL,
-  day TEXT NOT NULL,
-  received INTEGER NOT NULL DEFAULT 0,
-  processed INTEGER NOT NULL DEFAULT 0,
-  delivered_ok INTEGER NOT NULL DEFAULT 0,
-  delivered_failed INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (webhook_id, day),
-  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_counters_day ON webhook_daily_counters(day);
-
--- Per-subscription delivery stats (subscription-level analytics).
--- received/processed stay webhook-level (ingest + pre-action); delivery
--- outcomes (enqueued / delivered_ok / delivered_failed) are tracked here.
+-- Subscription-level delivery stats (the ONLY analytics tables).
+-- The analytics queue consumer UPSERTs here async; hot path writes nothing.
+-- enqueued = delivery tasks fanned out per subscription;
+-- delivered_ok / delivered_failed = per-subscription outcomes.
 CREATE TABLE IF NOT EXISTS subscription_counters (
   subscription_id INTEGER PRIMARY KEY,
   webhook_id INTEGER NOT NULL,

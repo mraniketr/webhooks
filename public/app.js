@@ -8,6 +8,8 @@ let editingSubIndex = null; // null | number ('new' uses -1)
 let varCache = { wid: null, variables: null, hasSample: false };
 let lastTemplateField = null;
 let currentDetailId = null;
+let currentSubscriptionId = null;
+let currentSubscriptionWebhookId = null;
 
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }, ...opts });
@@ -33,12 +35,13 @@ function showPage(page) {
   currentPage = page;
   $$('.page').forEach(x => x.classList.add('hidden'));
   $(`#page-${page}`).classList.remove('hidden');
-  const navFor = ['detail', 'edit', 'subedit', 'preedit'].includes(page) ? 'webhooks' : page;
+  const navFor = ['detail', 'edit', 'subedit', 'preedit', 'subscription'].includes(page) ? 'webhooks' : page;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === navFor));
   const titles = {
     dashboard: ['Overview', 'Webhook health at a glance'],
     webhooks: ['Webhooks', 'All Webhooks'],
     detail: ['All Webhooks', 'Webhook details'],
+    subscription: ['All Webhooks', 'Subscription details'],
     edit: ['All Webhooks', 'Create or edit endpoint'],
     subedit: ['All Webhooks', 'Edit one subscription'],
     preedit: ['All Webhooks', 'Edit pre-action'],
@@ -210,13 +213,14 @@ function renderSubList() {
     const st = s.stats || {};
     const statBits = `${st.enqueued ?? 0} queued · ${st.delivered_ok ?? 0} ok · ${st.delivered_failed ?? 0} failed`;
     const row = document.createElement('div');
-    row.className = 'hook-row sub-list-row';
+    row.className = 'hook-row sub-list-row clickable';
     row.innerHTML = `<div><strong>${esc(s.name || s.target_url || 'Untitled subscription')}</strong>`
       + `<small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url || '—')}</small>`
       + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}</small>`
-      + `<small class="mono">${esc(statBits)}</small></div>`
+      + `<small class="mono">${esc(statBits)} · click for details</small></div>`
       + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
-    row.querySelector('button').onclick = () => openSubEditor(i);
+    row.querySelector('button').onclick = (e) => { e.stopPropagation(); openSubEditor(i); };
+    row.onclick = () => { if (s.id) openSubscription(s.id); else openSubEditor(i); };
     box.append(row);
   });
 }
@@ -401,6 +405,8 @@ $('#backToEdit').onclick = closeSubEditor;
 $('#cancelSubEdit').onclick = closeSubEditor;
 $('#backToListBtn').onclick = () => showPage('webhooks');
 $('#detailEditBtn').onclick = () => { if (currentDetailId) openEdit(currentDetailId); };
+$('#backToWebhookBtn').onclick = () => { if (currentSubscriptionWebhookId) openWebhook(currentSubscriptionWebhookId); else if (currentDetailId) openWebhook(currentDetailId); else showPage('webhooks'); };
+$('#subDetailEditBtn').onclick = () => { if (currentSubscriptionWebhookId) openEdit(currentSubscriptionWebhookId); };
 $('#subAddHdr').onclick = () => $('#subHeadersBox').append(headerEditorRow('', ''));
 $('#subPayloadMode').onchange = syncSubPayloadMode;
 $('#subVarsBtn').onclick = toggleSubVarPanel;
@@ -460,19 +466,19 @@ $('#webhookForm').onsubmit = async e => {
   } catch (err) { toast(err.message, true); }
 };
 function renderStats(s) {
-  $('#statsGrid').innerHTML = [['Events', s.total || 0, 'Accepted into the queue'], ['Processed', s.processed || 0, 'Pre-action ran, fanned out'], ['Pending', s.pending || 0, 'Queued or in flight'], ['Failed', s.failed || 0, 'Failed deliveries']].map(([l, v, sub]) => `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join('');
+  $('#statsGrid').innerHTML = [['Queued', s.enqueued || 0, 'Deliveries fanned out to subscriptions'], ['Delivered', s.delivered_ok || 0, 'Successful forwards'], ['Pending', s.pending || 0, 'Queued or in flight'], ['Failed', s.delivered_failed || 0, 'Failed deliveries']].map(([l, v, sub]) => `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join('');
 }
 async function loadDashboard() {
   try {
     const d = await api('/api/dashboard');
     renderStats(d.stats);
-    $('#dashboardWebhooks').innerHTML = d.webhooks?.length ? `<div class="hook-list">${d.webhooks.slice(0, 6).map(w => `<div class="hook-row"><div><strong>${esc(w.name)}</strong><small>${w.events || 0} events · ${w.status}</small></div><button class="ghost" onclick="openWebhook(${w.id})">Open</button></div>`).join('')}</div>` : '<div class="empty">Create your first webhook.</div>';
+    $('#dashboardWebhooks').innerHTML = d.webhooks?.length ? `<div class="hook-list">${d.webhooks.slice(0, 6).map(w => `<div class="hook-row clickable" onclick="openWebhook(${w.id})"><div><strong>${esc(w.name)}</strong><small>${w.subscription_count || 0} subscription${(w.subscription_count || 0) === 1 ? '' : 's'} · ${w.delivered_ok || 0} delivered · ${w.status}</small></div><button class="ghost" onclick="event.stopPropagation();openWebhook(${w.id})">Open</button></div>`).join('')}</div>` : '<div class="empty">Create your first webhook.</div>';
   } catch (err) { toast(err.message, true); }
 }
 async function loadWebhooks() {
   try {
     const d = await api('/api/webhooks');
-    $('#webhooksTable').innerHTML = d.webhooks?.length ? `<table class="table"><thead><tr><th>Name</th><th>Endpoint</th><th>Events</th><th>Status</th><th></th></tr></thead><tbody>${d.webhooks.map(w => `<tr><td><strong>${esc(w.name)}</strong></td><td class="mono">/webhooks/${w.token.slice(0, 12)}…</td><td>${w.events ?? 0}</td><td><span class="badge ${w.status === 'active' ? 'processed' : 'failed'}">${esc(w.status || 'active')}</span></td><td><button class="ghost" onclick="openWebhook(${w.id})">Inspect</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No webhooks yet.</div>';
+    $('#webhooksTable').innerHTML = d.webhooks?.length ? `<table class="table"><thead><tr><th>Name</th><th>Endpoint</th><th>Subscriptions</th><th>Delivered</th><th>Failed</th><th>Status</th><th></th></tr></thead><tbody>${d.webhooks.map(w => `<tr class="clickable" onclick="openWebhook(${w.id})"><td><strong>${esc(w.name)}</strong></td><td class="mono">/webhooks/${w.token.slice(0, 12)}…</td><td>${w.subscription_count ?? 0}</td><td>${w.delivered_ok ?? 0}</td><td>${w.delivered_failed ?? 0}</td><td><span class="badge ${w.status === 'active' ? 'processed' : 'failed'}">${esc(w.status || 'active')}</span></td><td><button class="ghost" onclick="event.stopPropagation();openWebhook(${w.id})">Inspect</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No webhooks yet.</div>';
   } catch (err) { toast(err.message, true); }
 }
 async function openWebhook(id) {
@@ -484,15 +490,38 @@ async function openWebhook(id) {
     const d = await api('/api/webhooks/' + id);
     currentWebhook = d.webhook;
     $('#detailName').textContent = currentWebhook.name;
-    $('#detailSub').textContent = `${currentWebhook.url} · ${d.stats.total || 0} events received`;
+    $('#detailSub').textContent = `${currentWebhook.url} · ${d.subscriptions.length} subscription${d.subscriptions.length === 1 ? '' : 's'}`;
     $('#webhookDetail').innerHTML = `<div class="detail-title"><div><div class="url-box"><code>${esc(currentWebhook.url)}</code><button type="button" class="ghost" onclick="copyWebhookUrl()">Copy URL</button></div><div class="curl-box"><div class="curl-head"><span>Test with curl</span><button type="button" class="ghost sm" onclick="copyWebhookCurl()">Copy curl</button></div><pre class="curl-code"><code>${esc(buildCurl(currentWebhook.url))}</code></pre></div></div></div>`
-      + `<div class="detail-stats">${[['Received', d.stats.total || 0], ['Processed', d.stats.processed || 0], ['Delivered', d.stats.delivered_ok || 0], ['Failed', d.stats.failed || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
+      + `<div class="detail-stats">${[['Queued', d.stats.enqueued || 0], ['Delivered', d.stats.delivered_ok || 0], ['Failed', d.stats.delivered_failed || 0], ['Pending', d.stats.pending || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
       + `<div class="panel-head"><div><h3>Pre-action</h3><p>Sets a key-value <code>pre</code> object — subscriptions use <code>{{ pre.key }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? (() => { const a = d.actions[0]; return `<div class="action-item"><strong>${esc(a.name || 'Pre-action')}</strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`; })() : '<div class="empty">No pre-action configured.</div>'}</div>`
-      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => { const st = s.stats || {}; const enq = st.enqueued ?? s.enqueued ?? 0; const ok = st.delivered_ok ?? s.delivered_ok ?? 0; const fail = st.delivered_failed ?? s.delivered_failed ?? 0; return `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small><small class="mono">${enq} queued · ${ok} delivered · ${fail} failed</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`; }).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Click a subscription for its delivery stats. Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => { const st = s.stats || {}; const enq = st.enqueued ?? s.enqueued ?? 0; const ok = st.delivered_ok ?? s.delivered_ok ?? 0; const fail = st.delivered_failed ?? s.delivered_failed ?? 0; return `<div class="action-item clickable" onclick="openSubscription(${s.id})"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small><small class="mono">${enq} queued · ${ok} delivered · ${fail} failed — click for details</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`; }).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
+  } catch (err) { toast(err.message, true); }
+}
+async function openSubscription(id) {
+  currentSubscriptionId = Number(id);
+  showPage('subscription');
+  $('#subDetailName').textContent = 'Loading…';
+  $('#subscriptionDetail').innerHTML = '<div class="empty">Loading subscription…</div>';
+  try {
+    const d = await api('/api/subscriptions/' + id);
+    const s = d.subscription;
+    currentSubscriptionWebhookId = d.webhook?.id || null;
+    const st = s.stats || {};
+    const enq = st.enqueued ?? s.enqueued ?? 0;
+    const ok = st.delivered_ok ?? s.delivered_ok ?? 0;
+    const fail = st.delivered_failed ?? s.delivered_failed ?? 0;
+    const pending = st.pending ?? Math.max(0, enq - ok - fail);
+    $('#subDetailName').textContent = s.name || 'Subscription';
+    $('#subDetailSub').textContent = `${d.webhook?.name ? esc(d.webhook.name) + ' · ' : ''}${esc(s.http_method || 'POST')} ${esc(s.target_url)}`;
+    $('#subDetailSub').innerHTML = `${s.enabled ? 'enabled' : 'disabled'} · <span class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</span>`;
+    const dailyRows = (d.daily || []).map(r => `<tr><td class="mono">${esc(r.day)}</td><td>${r.enqueued ?? 0}</td><td>${r.delivered_ok ?? 0}</td><td>${r.delivered_failed ?? 0}</td></tr>`).join('');
+    $('#subscriptionDetail').innerHTML = `<div class="detail-stats">${[['Queued', enq], ['Delivered', ok], ['Failed', fail], ['Pending', pending]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
+      + `<div class="panel-head"><div><h3>Configuration</h3><p>How this subscription forwards events.</p></div></div><div class="action-list"><div class="action-item"><strong>Target</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}</small>${s.headers && Object.keys(s.headers).length ? `<pre>${esc(JSON.stringify(s.headers, null, 2))}</pre>` : ''}${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div></div>`
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Daily breakdown</h3><p>Per-day delivery counts for the last 30 days.</p></div><span class="count-pill">${(d.daily || []).length}</span></div>${(d.daily || []).length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Day</th><th>Queued</th><th>Delivered</th><th>Failed</th></tr></thead><tbody>${dailyRows}</tbody></table></div>` : '<div class="empty">No deliveries yet.</div>'}`;
   } catch (err) { toast(err.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }
-window.openWebhook = openWebhook; window.openEdit = openEdit;
+window.openWebhook = openWebhook; window.openEdit = openEdit; window.openSubscription = openSubscription;
 window.toast = toast; window.copyWebhookUrl = copyWebhookUrl; window.copyWebhookCurl = copyWebhookCurl;
 window.copyText = copyText; window.buildCurl = buildCurl;
 bootstrap();
