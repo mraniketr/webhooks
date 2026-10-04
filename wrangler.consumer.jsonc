@@ -10,6 +10,12 @@
       "database_id": "7d4b3e40-3ba2-4d52-84f5-fa24329102e0"
     }
   ],
+  "kv_namespaces": [
+    {
+      "binding": "WEBHOOK_CACHE",
+      "id": "f0e6c89803434a74bb8216e2ecb99500"
+    }
+  ],
   "queues": {
     "producers": [
       { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" },
