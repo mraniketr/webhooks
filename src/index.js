@@ -110,6 +110,90 @@ function webhookView(w, request) {
   return { id: w.id, name: w.name, token: w.token, status: w.status, created_at: w.created_at,
     url: `${new URL(request.url).origin}/webhooks/${w.token}` };
 }
+
+function normalizeActions(input) {
+  if (!Array.isArray(input)) return null; // null = not provided, leave unchanged
+  const out = [];
+  for (const item of input) {
+    if (!item || !["pre", "post"].includes(item.phase) || !item.code) continue;
+    out.push({
+      phase: item.phase,
+      name: String(item.name || `Action ${out.length + 1}`).slice(0, 100),
+      code: String(item.code).slice(0, 20000),
+      enabled: item.enabled === false ? 0 : 1,
+    });
+  }
+  return out;
+}
+
+function normalizeSubscriptions(input) {
+  if (!Array.isArray(input)) return null; // null = not provided, leave unchanged
+  const out = [];
+  for (const item of input) {
+    const target = String(item?.target_url ?? item?.url ?? "").trim();
+    try {
+      const u = new URL(target);
+      if (!["http:", "https:"].includes(u.protocol)) continue;
+    } catch { continue; }
+    out.push({
+      id: Number(item?.id) || undefined,
+      name: String(item?.name || target).slice(0, 100),
+      target_url: target.slice(0, 2000),
+      secret: item?.secret ? String(item.secret).slice(0, 500) : null,
+      enabled: item?.enabled === false ? 0 : 1,
+    });
+  }
+  return out;
+}
+
+async function saveActions(env, wid, actions) {
+  await env.DB.prepare("DELETE FROM actions WHERE webhook_id=?").bind(wid).run();
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i];
+    await env.DB.prepare("INSERT INTO actions (webhook_id,phase,name,code,sort_order,enabled) VALUES (?,?,?,?,?,?)")
+      .bind(wid, a.phase, a.name, a.code, i, a.enabled).run();
+  }
+}
+
+async function saveSubscriptions(env, wid, subs) {
+  await env.DB.prepare("DELETE FROM subscriptions WHERE webhook_id=?").bind(wid).run();
+  const created = now();
+  for (const s of subs) {
+    await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+      .bind(wid, s.name, s.target_url, s.secret, s.enabled, created).run();
+  }
+}
+
+async function webhookRelations(env, wid) {
+  const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? ORDER BY phase,sort_order,id").bind(wid).all();
+  const subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
+    CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
+    FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+  return { actions: actions.results, subscriptions: subscriptions.results };
+}
+
+async function mergeSubscriptions(env, wid, input) {
+  // Update in place when an id matches (preserves the signing secret when
+  // the client leaves it blank); insert new rows; delete removed rows.
+  const current = await env.DB.prepare("SELECT * FROM subscriptions WHERE webhook_id=?").bind(wid).all();
+  const byId = new Map(current.results.map((s) => [s.id, s]));
+  const seen = new Set();
+  for (const item of input) {
+    const id = Number(item.id);
+    if (id && byId.has(id)) {
+      seen.add(id);
+      const prev = byId.get(id);
+      await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=? WHERE id=?")
+        .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled, id).run();
+    } else {
+      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+        .bind(wid, item.name, item.target_url, item.secret || null, item.enabled, now()).run();
+    }
+  }
+  for (const s of current.results) {
+    if (!seen.has(s.id)) await env.DB.prepare("DELETE FROM subscriptions WHERE id=?").bind(s.id).run();
+  }
+}
 function parsePayload(request, raw) {
   if (!raw) return null;
   const ct = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
@@ -228,19 +312,38 @@ export default {
           const hook = await env.DB.prepare("INSERT INTO webhooks (user_id,name,token,created_at) VALUES (?,?,?,?)")
             .bind(user.id, name, token, created).run();
           const wid = hook.meta.last_row_id;
-          const actions = Array.isArray(b.actions) ? b.actions : [];
-          for (let i = 0; i < actions.length; i++) {
-            const a = actions[i];
-            if (!["pre", "post"].includes(a.phase) || !a.code) continue;
-            await env.DB.prepare("INSERT INTO actions (webhook_id,phase,name,code,sort_order,enabled) VALUES (?,?,?,?,?,?)")
-              .bind(wid, a.phase, String(a.name || `Action ${i + 1}`), String(a.code), i, a.enabled === false ? 0 : 1).run();
-          }
+          const actions = normalizeActions(b.actions) || [];
+          await saveActions(env, wid, actions);
+          const subs = normalizeSubscriptions(b.subscriptions) || [];
+          await saveSubscriptions(env, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
-          const actionRows = await env.DB.prepare("SELECT * FROM actions WHERE webhook_id=? ORDER BY phase,sort_order,id").bind(wid).all();
-          return json({ webhook: webhookView(w, request), actions: actionRows.results }, 201);
+          const rel = await webhookRelations(env, wid);
+          return json({ webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions }, 201);
         }
 
         const hookIdMatch = p.match(/^\/api\/webhooks\/(\d+)$/);
+        if ((request.method === "PUT" || request.method === "PATCH") && hookIdMatch) {
+          const wid = Number(hookIdMatch[1]);
+          const existing = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          if (!existing) return json({ error: "Not found" }, 404);
+          const b = await readJson(request);
+          if (b.name !== undefined) {
+            const name = String(b.name || "").trim();
+            if (!name) return json({ error: "Name is required" }, 400);
+            await env.DB.prepare("UPDATE webhooks SET name=? WHERE id=?").bind(name.slice(0, 200), wid).run();
+          }
+          if (b.status !== undefined) {
+            if (!["active", "disabled"].includes(b.status)) return json({ error: "Status must be active or disabled" }, 400);
+            await env.DB.prepare("UPDATE webhooks SET status=? WHERE id=?").bind(b.status, wid).run();
+          }
+          const actions = normalizeActions(b.actions);
+          if (actions) await saveActions(env, wid, actions);
+          const subs = normalizeSubscriptions(b.subscriptions);
+          if (subs) await mergeSubscriptions(env, wid, subs);
+          const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const rel = await webhookRelations(env, wid);
+          return json({ webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
+        }
         if (request.method === "GET" && hookIdMatch) {
           const wid = Number(hookIdMatch[1]);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
@@ -250,8 +353,8 @@ export default {
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
             SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) pending
             FROM events WHERE webhook_id=?`).bind(wid).first();
-          const actions = await env.DB.prepare("SELECT * FROM actions WHERE webhook_id=? ORDER BY phase,sort_order,id").bind(wid).all();
-          return json({ webhook: webhookView(w, request), stats, actions: actions.results, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+          const rel = await webhookRelations(env, wid);
+          return json({ webhook: webhookView(w, request), stats, actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
         }
 
         const eventsMatch = p.match(/^\/api\/webhooks\/(\d+)\/events$/);
@@ -273,7 +376,11 @@ export default {
           const event = await env.DB.prepare(`SELECT e.*,w.name webhook_name,w.token
             FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE e.id=? AND w.user_id=?`).bind(Number(eventMatch[1]), user.id).first();
           if (!event) return json({ error: "Not found" }, 404);
-          return json({ event: { ...event, headers: JSON.parse(event.headers_json || "{}"), payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body } });
+          const deliveries = await env.DB.prepare(`SELECT d.id,d.subscription_id,d.target_url,d.status,d.attempts,d.http_status,
+            d.response_preview,d.error,d.created_at,d.completed_at,s.name subscription_name
+            FROM deliveries d LEFT JOIN subscriptions s ON s.id=d.subscription_id
+            WHERE d.event_id=? ORDER BY d.id`).bind(event.id).all();
+          return json({ event: { ...event, headers: JSON.parse(event.headers_json || "{}"), payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
         }
       }
 

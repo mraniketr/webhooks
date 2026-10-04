@@ -1,13 +1,20 @@
-import { processEvent } from "./processing.js";
+import { processDelivery, processEvent } from "./processing.js";
 
-// Dedicated queue consumer worker.
+// Consumer worker for both queues.
 //
-// Responsibilities:
-// - Drain `hooklane-events` and mark events processed/failed in D1.
-// - Scale / retry independently of the API + producer worker (src/index.js).
+// - `hooklane-events` (main queue): run actions, fan out one task per
+//   subscription into `hooklane-deliveries`, then ack. Delivery failures
+//   never block this queue.
+// - `hooklane-deliveries` (task queue): forward one event to one URL with
+//   its own retry budget, logged in the deliveries table.
 //
 // This worker has no HTTP routes; `fetch` only exists so direct hits
 // return a clear 404 instead of a missing-handler error.
+
+const HANDLERS = {
+  "hooklane-events": processEvent,
+  "hooklane-deliveries": processDelivery,
+};
 
 export default {
   async fetch() {
@@ -18,9 +25,10 @@ export default {
   },
 
   async queue(batch, env, ctx) {
+    const handler = HANDLERS[batch.queue] || processEvent;
     for (const message of batch.messages) {
       try {
-        await processEvent(message.body, env, ctx);
+        await handler(message.body, env, ctx);
         message.ack();
       } catch (error) {
         console.error(
@@ -28,7 +36,7 @@ export default {
             level: "error",
             msg: "queue message failed, retrying",
             queue: batch.queue,
-            eventId: message.body?.eventId,
+            body: message.body,
             error: error?.message || String(error),
           })
         );

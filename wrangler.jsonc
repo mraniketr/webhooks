@@ -11,7 +11,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "hooklane-db"
+      "database_name": "hooklane-db",
+      "database_id": "7d4b3e40-3ba2-4d52-84f5-fa24329102e0"
     }
   ],
   "queues": {
