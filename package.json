@@ -1,0 +1,14 @@
+{
+  "name": "hooklane-webhook-service",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Async webhook service for Cloudflare Workers, D1, Queues and Dynamic Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute hooklane-db --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
