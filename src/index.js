@@ -136,6 +136,7 @@ async function apiJson(user, env, ttlMs, body, status = 200) {
 function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at }; }
 function webhookView(w, request) {
   return { id: w.id, name: w.name, token: w.token, status: w.status, created_at: w.created_at,
+    events: Number(w.events ?? 0), processed: Number(w.processed ?? 0), failed: Number(w.failed ?? 0),
     url: `${new URL(request.url).origin}/webhooks/${w.token}` };
 }
 
