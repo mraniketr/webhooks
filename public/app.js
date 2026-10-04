@@ -30,9 +30,16 @@ function showPage(page) {
   $$('.page').forEach(x => x.classList.add('hidden'));
   $(`#page-${page}`).classList.remove('hidden');
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
-  $('#pageEyebrow').textContent = page === 'dashboard' ? 'Overview' : 'Webhooks';
-  $('#pageTitle').textContent = page === 'dashboard' ? 'Webhook health at a glance' : 'Endpoints and event streams';
-  if (page === 'dashboard') loadDashboard(); else loadWebhooks();
+  const titles = {
+    dashboard: ['Overview', 'Webhook health at a glance'],
+    webhooks: ['Webhooks', 'Endpoints and event streams'],
+    edit: ['Webhooks', 'Create or edit endpoint'],
+  };
+  const [eyebrow, title] = titles[page] || titles.webhooks;
+  $('#pageEyebrow').textContent = eyebrow;
+  $('#pageTitle').textContent = title;
+  if (page === 'dashboard') loadDashboard(); else if (page === 'webhooks') loadWebhooks();
+  window.scrollTo(0, 0);
 }
 function showAuth() { $('#authView').classList.remove('hidden'); $('#appView').classList.add('hidden'); }
 function showApp() {
@@ -61,30 +68,35 @@ $$('[data-page]').forEach(b => b.onclick = () => showPage(b.dataset.page));
 
 function openCreate() {
   editingId = null; varCache = { wid: null, variables: null, hasSample: false };
-  $('#modalEyebrow').textContent = 'NEW ENDPOINT';
-  $('#modalTitle').textContent = 'Create webhook';
+  $('#editEyebrow').textContent = 'NEW ENDPOINT';
+  $('#editTitle').textContent = 'Create webhook';
   $('#webhookSubmit').textContent = 'Create webhook';
   $('#webhookName').value = ''; $('#webhookStatus').value = 'active';
   $('#actionRows').innerHTML = ''; $('#subRows').innerHTML = '';
   $('#actionRows').append(actionRow({ phase: 'pre' }));
   $('#subRows').append(subRow({}));
-  $('#modal').classList.remove('hidden');
+  showPage('edit');
 }
 async function openEdit(id) {
   try {
     const d = await api('/api/webhooks/' + id);
     editingId = id; varCache = { wid: null, variables: null, hasSample: false };
-    $('#modalEyebrow').textContent = 'EDIT ENDPOINT';
-    $('#modalTitle').textContent = 'Edit webhook';
+    $('#editEyebrow').textContent = 'EDIT ENDPOINT';
+    $('#editTitle').textContent = 'Edit webhook';
     $('#webhookSubmit').textContent = 'Save changes';
     $('#webhookName').value = d.webhook.name;
     $('#webhookStatus').value = d.webhook.status || 'active';
     $('#actionRows').innerHTML = ''; $('#subRows').innerHTML = '';
     (d.actions.length ? d.actions : [{}]).forEach(a => $('#actionRows').append(actionRow(a)));
     (d.subscriptions.length ? d.subscriptions : [{}]).forEach(s => $('#subRows').append(subRow(s)));
-    $('#modal').classList.remove('hidden');
+    showPage('edit');
     loadVariables(id);
   } catch (err) { toast(err.message, true); }
+}
+function cancelEdit() {
+  const id = editingId;
+  editingId = null;
+  if (id) openWebhook(id); else showPage('webhooks');
 }
 
 function actionRow(a = {}) {
@@ -253,7 +265,8 @@ async function previewSubscription(card) {
 ['#newWebhookBtn', '#newWebhookBtn2', '#newWebhookBtn3'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
 $('#addActionBtn').onclick = () => $('#actionRows').append(actionRow({}));
 $('#addSubBtn').onclick = () => $('#subRows').append(subRow({}));
-$('#closeModal').onclick = $('#cancelModal').onclick = () => $('#modal').classList.add('hidden');
+$('#cancelEdit').onclick = cancelEdit;
+$('#backToWebhooks').onclick = cancelEdit;
 $('#closeEventModal').onclick = () => $('#eventModal').classList.add('hidden');
 $('#webhookForm').onsubmit = async e => {
   e.preventDefault();
@@ -261,10 +274,10 @@ $('#webhookForm').onsubmit = async e => {
   try {
     if (editingId) {
       const d = await api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(body) });
-      $('#modal').classList.add('hidden'); toast('Webhook updated'); openWebhook(d.webhook.id);
+      toast('Webhook updated'); openWebhook(d.webhook.id);
     } else {
       const d = await api('/api/webhooks', { method: 'POST', body: JSON.stringify(body) });
-      $('#modal').classList.add('hidden'); toast('Webhook created'); showPage('webhooks'); openWebhook(d.webhook.id);
+      toast('Webhook created'); showPage('webhooks'); openWebhook(d.webhook.id);
     }
   } catch (err) { toast(err.message, true); }
 };
