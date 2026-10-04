@@ -25,6 +25,23 @@ function sessionTtlMs(env) {
   return DEFAULT_SESSION_TTL_MS;
 }
 
+// ---- Google SSO (OAuth 2.0 authorization code flow) ----
+function googleConfigured(env) {
+  return Boolean(env?.GOOGLE_CLIENT_ID && env?.GOOGLE_CLIENT_SECRET);
+}
+function googleRedirectUri(request) {
+  return `${new URL(request.url).origin}/api/auth/google/callback`;
+}
+async function ensureGoogleColumn(env) {
+  // Best-effort auto-migration for DBs created before google_sub existed.
+  try {
+    const cols = await env.DB.prepare("PRAGMA table_info(users)").all();
+    const names = new Set((cols.results || []).map((c) => c.name));
+    if (!names.has("google_sub")) await env.DB.prepare("ALTER TABLE users ADD COLUMN google_sub TEXT").run();
+    await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)").run();
+  } catch { /* ignore — callback falls back to email-only lookup */ }
+}
+
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
@@ -378,6 +395,106 @@ export default {
     if (p.endsWith(".js") || p.endsWith(".css") || p.endsWith(".html")) return env.ASSETS.fetch(request);
 
     try {
+      if (request.method === "GET" && p === "/api/auth/config") {
+        return json({ googleEnabled: googleConfigured(env) });
+      }
+
+      if (request.method === "GET" && p === "/api/auth/google/start") {
+        if (!googleConfigured(env)) return text("Google SSO is not configured", 500);
+        const state = randomToken(32);
+        const redirectUri = googleRedirectUri(request);
+        const authUrl = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
+          client_id: env.GOOGLE_CLIENT_ID,
+          redirect_uri: redirectUri,
+          response_type: "code",
+          scope: "openid email profile",
+          state,
+          prompt: "select_account",
+        }).toString();
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: authUrl,
+            "set-cookie": `oauth_state=${encodeURIComponent(state)}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600`,
+            "cache-control": "no-store",
+          },
+        });
+      }
+
+      if (request.method === "GET" && p === "/api/auth/google/callback") {
+        if (!googleConfigured(env)) return text("Google SSO is not configured", 500);
+        const fail = (msg) => Response.redirect(`${new URL(request.url).origin}/?sso_error=${encodeURIComponent(msg)}`, 302);
+        const code = url.searchParams.get("code");
+        const state = url.searchParams.get("state");
+        const stateCookie = getCookie(request, "oauth_state");
+        if (!code || !state || !stateCookie || state !== stateCookie) return fail("Invalid login state. Please try again.");
+        const redirectUri = googleRedirectUri(request);
+        // Exchange code for tokens.
+        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            client_id: env.GOOGLE_CLIENT_ID,
+            client_secret: env.GOOGLE_CLIENT_SECRET,
+            code,
+            grant_type: "authorization_code",
+            redirect_uri: redirectUri,
+          }).toString(),
+        });
+        if (!tokenRes.ok) return fail("Google login failed. Please try again.");
+        const tokens = await tokenRes.json().catch(() => null);
+        if (!tokens?.access_token) return fail("Google login failed. Please try again.");
+        // Fetch profile.
+        const meRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+          headers: { authorization: `Bearer ${tokens.access_token}` },
+        });
+        if (!meRes.ok) return fail("Could not read Google profile.");
+        const profile = await meRes.json().catch(() => null);
+        const sub = String(profile?.sub || "");
+        const email = String(profile?.email || "").trim().toLowerCase();
+        if (!sub || !email || !email.includes("@")) return fail("Google account has no verified email.");
+        if (profile?.email_verified === false) return fail("Google email is not verified.");
+        const name = String(profile?.name || profile?.given_name || email.split("@")[0]).slice(0, 200);
+        await ensureGoogleColumn(env);
+        let user = null;
+        try {
+          user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE google_sub=?").bind(sub).first();
+        } catch { user = null; }
+        if (!user) {
+          const byEmail = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE email=?").bind(email).first();
+          if (byEmail) {
+            try {
+              await env.DB.prepare("UPDATE users SET google_sub=? WHERE id=?").bind(sub, byEmail.id).run();
+            } catch {
+              return fail("This email is already registered. Please log in with your password first.");
+            }
+            user = byEmail;
+          } else {
+            const created = now();
+            try {
+              const result = await env.DB.prepare(
+                "INSERT INTO users (email,name,password_hash,password_salt,created_at,google_sub) VALUES (?,?,?,?,?,?)"
+              ).bind(email, name, "OAUTH", "OAUTH", created, sub).run();
+              user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
+            } catch {
+              // Column may not exist on old DBs — fall back to placeholder insert.
+              const result = await env.DB.prepare(
+                "INSERT INTO users (email,name,password_hash,password_salt,created_at) VALUES (?,?,?,?,?)"
+              ).bind(email, name, "OAUTH", "OAUTH", created).run();
+              user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
+            }
+          }
+        }
+        if (!user) return fail("Could not create account.");
+        const hdrs = new Headers();
+        hdrs.set("location", new URL(request.url).origin + "/");
+        hdrs.set("cache-control", "no-store");
+        hdrs.append("set-cookie", await sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs));
+        // Clear the one-time OAuth state cookie.
+        hdrs.append("set-cookie", "oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0");
+        return new Response(null, { status: 302, headers: hdrs });
+      }
+
       if (request.method === "POST" && p === "/api/auth/signup") {
         const b = await readJson(request);
         const email = String(b.email || "").trim().toLowerCase();
@@ -399,7 +516,9 @@ export default {
         const email = String(b.email || "").trim().toLowerCase();
         const password = String(b.password || "");
         const user = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
-        if (!user || !(await verifyPassword(password, user.password_salt, user.password_hash))) return json({ error: "Invalid email or password" }, 401);
+        if (!user) return json({ error: "Invalid email or password" }, 401);
+        if (user.password_hash === "OAUTH" || user.password_salt === "OAUTH") return json({ error: "This account uses Google sign-in. Please continue with Google." }, 401);
+        if (!(await verifyPassword(password, user.password_salt, user.password_hash))) return json({ error: "Invalid email or password" }, 401);
         return json({ user: sanitizeUser(user) }, 200, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) });
       }
 

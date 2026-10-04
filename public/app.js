@@ -58,7 +58,18 @@ function showApp() {
   $('#avatar').textContent = user.name?.[0]?.toUpperCase() || 'A';
   showPage('dashboard');
 }
-async function bootstrap() { try { const d = await api('/api/me'); user = d.user; showApp(); } catch { showAuth(); } }
+async function bootstrap() {
+  try {
+    const q = new URLSearchParams(location.search);
+    const ssoError = q.get('sso_error');
+    if (ssoError) {
+      history.replaceState(null, '', location.pathname);
+      setTimeout(() => toast(ssoError, true), 50);
+    }
+  } catch {}
+  try { const cfg = await api('/api/auth/config'); const w = $('#ssoWrap'); if (w && cfg.googleEnabled) w.classList.remove('hidden'); } catch {}
+  try { const d = await api('/api/me'); user = d.user; showApp(); } catch { showAuth(); }
+}
 $$('.tab').forEach(b => b.onclick = () => {
   authMode = b.dataset.auth;
   $$('.tab').forEach(x => x.classList.toggle('active', x === b));

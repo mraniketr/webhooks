@@ -21,6 +21,10 @@
         <div class="field"><label>Password</label><input id="password" type="password" autocomplete="current-password" placeholder="••••••••" required/></div>
         <button class="primary full" type="submit" id="authSubmit">Login</button>
       </form>
+      <div id="ssoWrap" class="hidden" style="margin-top:14px">
+        <div style="display:flex;align-items:center;gap:10px;color:#8a94a0;font-size:12px;margin:4px 0 10px"><span style="flex:1;height:1px;background:#222a31"></span>or<span style="flex:1;height:1px;background:#222a31"></span></div>
+        <a class="ghost full" id="googleBtn" href="/api/auth/google/start" style="display:flex;justify-content:center;text-decoration:none">Continue with Google</a>
+      </div>
     </div>
     <div class="feature-row"><span>✓ Queue-driven pipeline</span><span>✓ Async worker</span><span>✓ Per-user rate limit</span></div>
   </div>

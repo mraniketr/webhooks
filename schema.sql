@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  google_sub TEXT UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS webhooks (
