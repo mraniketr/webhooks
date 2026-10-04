@@ -30,23 +30,6 @@ CREATE TABLE IF NOT EXISTS actions (
   FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  webhook_id INTEGER NOT NULL,
-  method TEXT NOT NULL,
-  headers_json TEXT NOT NULL,
-  query_json TEXT,
-  payload_json TEXT,
-  pre_json TEXT,
-  raw_body TEXT,
-  ip TEXT,
-  status TEXT NOT NULL DEFAULT 'accepted',
-  error TEXT,
-  received_at TEXT NOT NULL,
-  processed_at TEXT,
-  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS subscriptions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   webhook_id INTEGER NOT NULL,
@@ -62,22 +45,30 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS deliveries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_id INTEGER NOT NULL,
-  subscription_id INTEGER,
-  target_url TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  http_status INTEGER,
-  response_preview TEXT,
-  error TEXT,
-  created_at TEXT NOT NULL,
-  completed_at TEXT,
-  FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE,
-  FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE SET NULL
+CREATE INDEX IF NOT EXISTS idx_subscriptions_webhook ON subscriptions(webhook_id);
+
+-- Aggregate-only analytics (hot path writes nothing per-event; the
+-- analytics queue consumer UPSERTs here async).
+CREATE TABLE IF NOT EXISTS webhook_counters (
+  webhook_id INTEGER PRIMARY KEY,
+  received INTEGER NOT NULL DEFAULT 0,
+  processed INTEGER NOT NULL DEFAULT 0,
+  delivered_ok INTEGER NOT NULL DEFAULT 0,
+  delivered_failed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_webhook_received ON events(webhook_id, received_at DESC);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_webhook ON subscriptions(webhook_id);
-CREATE INDEX IF NOT EXISTS idx_deliveries_event ON deliveries(event_id);
+CREATE TABLE IF NOT EXISTS webhook_daily_counters (
+  webhook_id INTEGER NOT NULL,
+  day TEXT NOT NULL,
+  received INTEGER NOT NULL DEFAULT 0,
+  processed INTEGER NOT NULL DEFAULT 0,
+  delivered_ok INTEGER NOT NULL DEFAULT 0,
+  delivered_failed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (webhook_id, day),
+  FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_counters_day ON webhook_daily_counters(day);

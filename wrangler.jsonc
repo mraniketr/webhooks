@@ -17,7 +17,8 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "WEBHOOK_QUEUE", "queue": "hooklane-events" }
+      { "binding": "WEBHOOK_QUEUE", "queue": "hooklane-events" },
+      { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
     ]
   },
   "ratelimits": [

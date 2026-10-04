@@ -12,7 +12,7 @@
   <div class="auth-panel">
     <div class="brand large"><span class="brand-mark">↯</span><span>Hooklane</span></div>
     <h1>Reliable webhooks, without the plumbing.</h1>
-    <p class="muted">Create endpoints, accept events fast, process them asynchronously, and inspect every delivery.</p>
+    <p class="muted">Create endpoints, accept events fast, forward them asynchronously, and track aggregate delivery counts.</p>
     <div class="auth-card">
       <div class="tabs"><button class="tab active" data-auth="login">Login</button><button class="tab" data-auth="signup">Create account</button></div>
       <form id="authForm">
@@ -22,7 +22,7 @@
         <button class="primary full" type="submit" id="authSubmit">Login</button>
       </form>
     </div>
-    <div class="feature-row"><span>✓ SQLite event store</span><span>✓ Async worker</span><span>✓ Per-user rate limit</span></div>
+    <div class="feature-row"><span>✓ Queue-driven pipeline</span><span>✓ Async worker</span><span>✓ Per-user rate limit</span></div>
   </div>
 </div>
 
@@ -42,10 +42,9 @@
   <main class="main">
     <header class="topbar"><div><div class="eyebrow" id="pageEyebrow">Overview</div><h2 id="pageTitle">Webhook health at a glance</h2></div><button class="primary" id="newWebhookBtn">＋ New webhook</button></header>
     <section id="page-dashboard" class="page">
-      <div class="hero-strip"><div><div class="eyebrow">SYSTEM STATUS</div><h3>Accept fast. Process later.</h3><p>Your public endpoints return <b>202 Accepted</b> after the event is queued. The worker handles storage and custom actions in the background.</p></div><div class="status-pill"><span></span> Operational</div></div>
+      <div class="hero-strip"><div><div class="eyebrow">SYSTEM STATUS</div><h3>Accept fast. Process later.</h3><p>Your public endpoints return <b>202 Accepted</b> after the event is queued. The worker runs the pre-action and forwards to subscriptions in the background. Status is in worker logs; analytics are aggregate counts.</p></div><div class="status-pill"><span></span> Operational</div></div>
       <div class="stats-grid" id="statsGrid"></div>
       <div class="section-grid">
-        <section class="panel"><div class="panel-head"><div><h3>Recent events</h3><p>Latest deliveries across your account.</p></div><button class="ghost" data-page="webhooks">View all</button></div><div id="recentEvents" class="table-wrap"></div></section>
         <section class="panel"><div class="panel-head"><div><h3>All Webhooks</h3><p>Your endpoints and delivery volume.</p></div><button class="ghost" id="newWebhookBtn2">Create</button></div><div id="dashboardWebhooks"></div></section>
       </div>
     </section>
@@ -53,7 +52,7 @@
       <div class="panel"><div class="panel-head"><div><h3>All Webhooks</h3><p>Create isolated webhook URLs with a pre-action and templated subscriptions.</p></div></div><div id="webhooksTable" class="table-wrap"></div></div>
     </section>
     <section id="page-detail" class="page hidden">
-      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-action, subscriptions and events.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK</div><h3 id="detailName">Webhook</h3><p id="detailSub">Endpoint details, pre-action, subscriptions and aggregate counts.</p></div><div style="display:flex;gap:8px"><button class="ghost" id="backToListBtn">← All webhooks</button><button class="ghost" id="detailEditBtn">Edit</button></div></div><div id="webhookDetail"></div></div>
     </section>
     <section id="page-edit" class="page hidden">
       <div class="panel"><div class="panel-head"><div><div class="eyebrow" id="editEyebrow">NEW ENDPOINT</div><h3 id="editTitle">Create webhook</h3><p>Configure processing actions and templated subscriptions.</p></div><button class="ghost" id="backToWebhooks">← Back</button></div>
@@ -64,7 +63,7 @@
         <div id="preSummary"></div>
         <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }}, {{ pre }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
         <div id="subList"></div>
-        <div class="callout"><b>Pipeline:</b> event is persisted, the pre-action runs (it sets a key-value <code>pre</code> object), then the payload plus <code>pre</code> is forwarded to each enabled subscription. Use <code>{{ pre.key }}</code> in subscription URL, headers &amp; JSON. Deliveries are logged per event.</div>
+        <div class="callout"><b>Pipeline:</b> the event travels in the queue (nothing stored per event), the pre-action runs (it sets a key-value <code>pre</code> object), then the payload plus <code>pre</code> is forwarded to each enabled subscription. Use <code>{{ pre.key }}</code> in subscription URL, headers &amp; JSON. Status is in worker logs; analytics are aggregate counts.</div>
         <div class="modal-actions"><button type="button" class="ghost" id="cancelEdit">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
       </form></div>
     </section>
@@ -106,6 +105,5 @@
   </main>
 </div>
 
-<div id="eventModal" class="modal hidden"><div class="modal-card wide"><div class="modal-head"><div><div class="eyebrow">EVENT</div><h3 id="eventTitle">Event</h3></div><button class="close" id="closeEventModal">×</button></div><pre id="eventJson" class="code-block"></pre><div id="eventDeliveries"></div></div></div>
 <script src="/app.js"></script>
 </body></html>

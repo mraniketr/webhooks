@@ -4,190 +4,172 @@ function now() {
   return new Date().toISOString();
 }
 
-async function runUserScript(code, row, webhookRow) {
-  // Free-plan compatible: Workers cannot eval/new Function or load dynamic
-  // code (the LOADER/Dynamic-Workers approach needs a Workers Paid plan),
-  // so the pre-action is evaluated as data-mapping statements only:
-  // `pre = { key: value, ... }` (plus `pre.key = value` lines, in order).
-  // Values may be plain literals, {{ }} templates, or simple references
-  // like event.payload.x / body.x / headers.x / query.x. Anything else is
-  // rejected with an error surfaced on the event — never executed.
-  const event = {
-    id: row.id,
-    webhookId: row.webhook_id,
-    payload: row.payload_json ? JSON.parse(row.payload_json) : row.raw_body,
-    headers: JSON.parse(row.headers_json || "{}"),
-    ip: row.ip,
-    receivedAt: row.received_at,
-  };
-  const baseCtx = buildContext(row, webhookRow, {});
-  const { pre, error } = evaluatePreAssignment(code, baseCtx);
-  const logs = error ? [`Pre-action: ${error}`] : [];
-  return { event, pre: error ? {} : pre, logs };
-}
-
-async function ensurePreColumn(env) {
+function dayOf(iso) {
   try {
-    const cols = await env.DB.prepare("PRAGMA table_info(events)").all();
-    const names = new Set((cols.results || []).map((c) => c.name));
-    if (!names.has("pre_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN pre_json TEXT").run();
-    return names.has("pre_json");
-  } catch { return false; }
+    return new Date(iso).toISOString().slice(0, 10);
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
 }
 
-async function hmacHex(secret, bodyText) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(bodyText));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+// Structured log line — the event/delivery status record. Surfaced via
+// Workers observability / logpush; no per-event D1 row on the hot path.
+function logEventStatus(fields) {
+  console.log(JSON.stringify({ level: "info", ...fields }));
 }
 
-function payloadText(payload) {
-  if (payload == null) return "";
-  return typeof payload === "string" ? payload : JSON.stringify(payload);
+// Build a template.js-compatible row shim from a queue-carried event so
+// buildContext() works unchanged without a DB fetch.
+function rowFromMessage(msg, pre) {
+  return {
+    id: msg.eventId,
+    webhook_id: msg.webhookId,
+    method: msg.method || "POST",
+    headers_json: JSON.stringify(msg.headers || {}),
+    query_json: JSON.stringify(msg.query || {}),
+    payload_json: msg.payload == null ? null : JSON.stringify(msg.payload),
+    raw_body: msg.rawBody ?? null,
+    ip: msg.ip || "",
+    received_at: msg.receivedAt || now(),
+    pre_json: pre === undefined ? null : JSON.stringify(pre ?? {}),
+  };
 }
 
-// Main queue: run the single pre-action (it sets a `pre` key-value object),
-// persist the event + pre, fan out one task per enabled subscription into
-// the delivery queue, ack.
-// Delivery failures never fail this handler — each delivery task carries
-// its own retry budget on the delivery queue.
+function analyticsMsg(webhookId, field, count = 1, at = now()) {
+  return { webhookId: Number(webhookId), field, count, day: dayOf(at) };
+}
+
+async function emitAnalytics(env, msg) {
+  // Analytics must never break the main flow — queue send is async and the
+  // analytics consumer owns all D1 writes with its own retry budget.
+  if (!env.ANALYTICS_QUEUE) return;
+  try {
+    await env.ANALYTICS_QUEUE.send(msg);
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "error",
+      msg: "analytics enqueue failed",
+      webhookId: msg.webhookId,
+      field: msg.field,
+      error: error?.message || String(error),
+    }));
+  }
+}
+
+async function runUserScript(code, msg, webhookRow) {
+  // Same contract as before: the pre-action only assigns a `pre` key-value
+  // object via data-mapping statements — never executed as JS.
+  const baseCtx = buildContext(rowFromMessage(msg), webhookRow, {});
+  const { pre, error } = evaluatePreAssignment(code, baseCtx);
+  return { pre: error ? {} : pre, error };
+}
+
+// Main queue: run the single pre-action (sets the `pre` key-value object),
+// fan out one delivery task per enabled subscription carrying the full
+// event + pre in the message, ack. No per-event D1 writes here — status is
+// emitted as a structured log, counts go to the analytics queue.
 async function processEvent(message, env, ctx) {
-  const eventId = Number(message.eventId);
-  const row = await env.DB.prepare("SELECT * FROM events WHERE id=?").bind(eventId).first();
-  if (!row) return;
+  const msg = message || {};
+  const eventId = msg.eventId != null ? String(msg.eventId) : "";
+  const webhookId = Number(msg.webhookId);
+  if (!eventId || !webhookId) return;
+
+  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?")
+    .bind(webhookId).first().catch(() => null);
   const actions = await env.DB.prepare(
     "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
-  )
-    .bind(row.webhook_id)
-    .all()
-    .catch(async () => await env.DB.prepare(
-      "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 ORDER BY sort_order, id"
-    ).bind(row.webhook_id).all());
-  let event = {
-    id: row.id,
-    webhookId: row.webhook_id,
-    payload: row.payload_json ? JSON.parse(row.payload_json) : row.raw_body,
-    headers: JSON.parse(row.headers_json || "{}"),
-    ip: row.ip,
-    receivedAt: row.received_at,
-  };
-  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(row.webhook_id).first().catch(() => null);
-  const logs = [];
+  ).bind(webhookId).all().catch(() => ({ results: [] }));
+
   let pre = {};
-
-  try {
-    const enabled = (actions.results || []).filter((x) => x.phase === "pre" || !x.phase);
-    const action = enabled[0];
-    if (action) {
-      const result = await runUserScript(action.code, row, webhookRow);
-      event = result.event;
-      logs.push(...(result.logs || []));
-      // Single pre-action contract: `pre` must be a key-value object.
-      pre = (result.pre && typeof result.pre === "object" && !Array.isArray(result.pre)) ? result.pre : {};
-    }
-
-    const preJson = JSON.stringify(pre);
-    const hasPreCol = await ensurePreColumn(env);
-    if (hasPreCol) {
-      await env.DB.prepare(
-        "UPDATE events SET payload_json=?, pre_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
-      )
-        .bind(event.payload == null ? null : JSON.stringify(event.payload), preJson, now(), eventId)
-        .run();
-    } else {
-      try {
-        await env.DB.prepare(
-          "UPDATE events SET payload_json=?, pre_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
-        )
-          .bind(event.payload == null ? null : JSON.stringify(event.payload), preJson, now(), eventId)
-          .run();
-      } catch {
-        await env.DB.prepare(
-          "UPDATE events SET payload_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
-        )
-          .bind(event.payload == null ? null : JSON.stringify(event.payload), now(), eventId)
-          .run();
-      }
-    }
-
-    const subs = await env.DB.prepare(
-      "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
-    )
-      .bind(row.webhook_id)
-      .all();
-    for (const sub of subs.results) {
-      await env.DELIVERY_QUEUE.send({ eventId, subscriptionId: sub.id });
-    }
-
-    if (logs.length) {
-      await env.DB.prepare("UPDATE events SET error=? WHERE id=?").bind(logs.join("\n"), eventId).run();
-    }
-  } catch (error) {
-    await env.DB.prepare("UPDATE events SET status='failed', error=?, processed_at=? WHERE id=?")
-      .bind(error?.message || String(error), now(), eventId)
-      .run();
-    throw error;
+  let preError = null;
+  const enabled = (actions.results || []).filter((x) => x.phase === "pre" || !x.phase);
+  const action = enabled[0];
+  if (action && action.code && String(action.code).trim()) {
+    const r = await runUserScript(action.code, msg, webhookRow);
+    pre = r.pre;
+    preError = r.error;
   }
+
+  const subs = await env.DB.prepare(
+    "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
+  ).bind(webhookId).all().catch(() => ({ results: [] }));
+  const targets = subs.results || [];
+
+  for (const sub of targets) {
+    await env.DELIVERY_QUEUE.send({
+      eventId,
+      webhookId,
+      subscriptionId: sub.id,
+      method: msg.method || "POST",
+      headers: msg.headers || {},
+      query: msg.query || {},
+      payload: msg.payload ?? null,
+      rawBody: msg.rawBody ?? null,
+      ip: msg.ip || "",
+      receivedAt: msg.receivedAt || now(),
+      pre,
+    });
+  }
+
+  await emitAnalytics(env, analyticsMsg(webhookId, "processed", 1, msg.receivedAt));
+
+  logEventStatus({
+    msg: "event processed",
+    status: "processed",
+    eventId,
+    webhookId,
+    deliveriesEnqueued: targets.length,
+    ...(preError ? { preError } : {}),
+  });
 }
 
 // Delivery queue: forward one event to one subscription URL. Throws on
 // failure so this task alone is retried — the main queue is unaffected.
-// The deliveries table is the idempotency record: already-successful
-// (event, subscription) pairs are skipped, attempts are counted per row.
+// Outcome is a structured log (with http_status) + an analytics increment;
+// no per-delivery D1 row.
 async function processDelivery(message, env, ctx) {
-  const eventId = Number(message.eventId);
-  const subscriptionId = Number(message.subscriptionId);
-  if (!eventId || !subscriptionId) return;
+  const msg = message || {};
+  const eventId = msg.eventId != null ? String(msg.eventId) : "";
+  const webhookId = Number(msg.webhookId);
+  const subscriptionId = Number(msg.subscriptionId);
+  if (!eventId || !webhookId || !subscriptionId) return;
 
-  const eventRow = await env.DB.prepare("SELECT * FROM events WHERE id=?").bind(eventId).first();
-  if (!eventRow) return;
   const sub = await env.DB.prepare("SELECT * FROM subscriptions WHERE id=?").bind(subscriptionId).first();
-  if (!sub || !sub.enabled) return;
-
-  let row = await env.DB.prepare("SELECT * FROM deliveries WHERE event_id=? AND subscription_id=?")
-    .bind(eventId, subscriptionId)
-    .first();
-  if (!row) {
-    const inserted = await env.DB.prepare(
-      "INSERT INTO deliveries (event_id,subscription_id,target_url,status,attempts,created_at) VALUES (?,?,?,?,?,?)"
-    )
-      .bind(eventId, subscriptionId, sub.target_url, "pending", 0, now())
-      .run();
-    row = await env.DB.prepare("SELECT * FROM deliveries WHERE id=?").bind(inserted.meta.last_row_id).first();
+  if (!sub || !sub.enabled) {
+    logEventStatus({
+      msg: "delivery skipped", status: "skipped",
+      eventId, webhookId, subscriptionId, reason: !sub ? "subscription gone" : "disabled",
+    });
+    return;
   }
-  if (row.status === "success") return;
 
-  const attempt = row.attempts + 1;
-  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(eventRow.webhook_id).first().catch(() => null);
-  const tplCtx = buildContext(eventRow, webhookRow);
+  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?")
+    .bind(webhookId).first().catch(() => null);
+  const tplCtx = buildContext(
+    rowFromMessage(msg, msg.pre || {}),
+    webhookRow,
+    msg.pre || {}
+  );
   const rendered = renderSubscription(sub, tplCtx);
-  // Sync the stored delivery URL with the rendered URL so history shows the real target.
-  if (rendered.url && rendered.url !== row.target_url) {
-    await env.DB.prepare("UPDATE deliveries SET target_url=? WHERE id=?").bind(rendered.url.slice(0, 2000), row.id).run();
-    row.target_url = rendered.url;
+
+  if (!rendered.url) {
+    const err = rendered.errors[0] || "Subscription template rendered an empty URL";
+    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt));
+    logEventStatus({
+      msg: "delivery failed", status: "failed",
+      eventId, webhookId, subscriptionId,
+      target: sub.target_url, http_status: null, error: err,
+    });
+    throw new Error(`${sub.name}: ${err}`);
   }
-  if (!rendered.url || rendered.errors.length && rendered.url === "") {
-    const message = rendered.errors[0] || "Subscription template rendered an empty URL";
-    await env.DB.prepare(
-      "UPDATE deliveries SET status='failed', attempts=?, http_status=?, response_preview=?, error=?, completed_at=? WHERE id=?"
-    )
-      .bind(attempt, null, null, message, now(), row.id)
-      .run();
-    throw new Error(`${sub.name}: ${message}`);
-  }
+
   const bodyText = rendered.bodyText;
+  const attemptHint = 1;
   const headers = {
     "content-type": "application/json",
     "X-Hooklane-Event-Id": String(eventId),
-    "X-Hooklane-Webhook-Id": String(eventRow.webhook_id),
-    "X-Hooklane-Delivery-Id": String(row.id),
-    "X-Hooklane-Attempt": String(attempt),
+    "X-Hooklane-Webhook-Id": String(webhookId),
+    "X-Hooklane-Attempt": String(attemptHint),
     ...rendered.headers,
   };
   if (sub.secret) {
@@ -211,19 +193,83 @@ async function processDelivery(message, env, ctx) {
   }
 
   if (outcome.ok) {
-    await env.DB.prepare(
-      "UPDATE deliveries SET status='success', attempts=?, http_status=?, response_preview=?, error=NULL, completed_at=? WHERE id=?"
-    )
-      .bind(attempt, outcome.httpStatus, outcome.preview, now(), row.id)
-      .run();
+    await emitAnalytics(env, analyticsMsg(webhookId, "delivered_ok", 1, msg.receivedAt));
+    logEventStatus({
+      msg: "delivery ok", status: "success",
+      eventId, webhookId, subscriptionId,
+      target: rendered.url, http_status: outcome.httpStatus,
+    });
     return;
   }
-  await env.DB.prepare(
-    "UPDATE deliveries SET status='failed', attempts=?, http_status=?, response_preview=?, error=?, completed_at=? WHERE id=?"
-  )
-    .bind(attempt, outcome.httpStatus, outcome.preview, outcome.message, now(), row.id)
-    .run();
+  await emitAnalytics(env, analyticsMsg(webhookId, "delivered_failed", 1, msg.receivedAt));
+  logEventStatus({
+    msg: "delivery failed", status: "failed",
+    eventId, webhookId, subscriptionId,
+    target: rendered.url, http_status: outcome.httpStatus, error: outcome.message,
+  });
   throw new Error(`${sub.name}: ${outcome.message}`);
 }
 
-export { now, processDelivery, processEvent, runUserScript };
+async function hmacHex(secret, bodyText) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(bodyText));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const ANALYTICS_FIELDS = new Set(["received", "processed", "delivered_ok", "delivered_failed"]);
+
+// Analytics queue: the ONLY writer of aggregate counters. Batches collapse
+// N messages into one UPSERT per (webhook, day), so hot-path throughput
+// never translates into per-event D1 writes.
+async function processAnalyticsBatch(messages, env) {
+  // Accumulate {webhookId -> {day -> {field -> count}}}
+  const acc = new Map();
+  for (const m of messages) {
+    const b = m.body || {};
+    const webhookId = Number(b.webhookId);
+    if (!webhookId || !ANALYTICS_FIELDS.has(b.field)) continue;
+    const day = String(b.day || dayOf(now()));
+    const count = Math.max(1, Math.min(10000, Number(b.count) || 1));
+    if (!acc.has(webhookId)) acc.set(webhookId, new Map());
+    const byDay = acc.get(webhookId);
+    if (!byDay.has(day)) byDay.set(day, { received: 0, processed: 0, delivered_ok: 0, delivered_failed: 0 });
+    byDay.get(day)[b.field] += count;
+  }
+  const ts = now();
+  for (const [webhookId, byDay] of acc) {
+    for (const [day, c] of byDay) {
+      await env.DB.prepare(
+        `INSERT INTO webhook_counters (webhook_id, received, processed, delivered_ok, delivered_failed, updated_at)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(webhook_id) DO UPDATE SET
+           received=received+excluded.received,
+           processed=processed+excluded.processed,
+           delivered_ok=delivered_ok+excluded.delivered_ok,
+           delivered_failed=delivered_failed+excluded.delivered_failed,
+           updated_at=excluded.updated_at`
+      ).bind(webhookId, c.received, c.processed, c.delivered_ok, c.delivered_failed, ts).run();
+      await env.DB.prepare(
+        `INSERT INTO webhook_daily_counters (webhook_id, day, received, processed, delivered_ok, delivered_failed, updated_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(webhook_id, day) DO UPDATE SET
+           received=received+excluded.received,
+           processed=processed+excluded.processed,
+           delivered_ok=delivered_ok+excluded.delivered_ok,
+           delivered_failed=delivered_failed+excluded.delivered_failed,
+           updated_at=excluded.updated_at`
+      ).bind(webhookId, day, c.received, c.processed, c.delivered_ok, c.delivered_failed, ts).run();
+    }
+  }
+}
+
+async function processAnalytics(message, env, ctx) {
+  await processAnalyticsBatch([{ body: message }], env);
+}
+
+export { analyticsMsg, dayOf, emitAnalytics, logEventStatus, now, processAnalytics, processAnalyticsBatch, processDelivery, processEvent, rowFromMessage, runUserScript };

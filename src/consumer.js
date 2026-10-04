@@ -1,21 +1,20 @@
-import { processDelivery, processEvent } from "./processing.js";
+import { processAnalyticsBatch, processDelivery, processEvent } from "./processing.js";
 
-// Consumer worker for both queues.
+// Consumer worker for all three queues.
 //
 // - `hooklane-events` (main queue): run the single pre-action (setting the
 //   `pre` key-value object), fan out one task per subscription into
-//   `hooklane-deliveries`, then ack.
+//   `hooklane-deliveries`, then ack. No D1 writes here — status goes to
+//   structured logs, counts go to the analytics queue.
 //   Delivery failures never block this queue.
 // - `hooklane-deliveries` (task queue): forward one event to one URL with
-//   its own retry budget, logged in the deliveries table.
+//   its own retry budget. Outcome is a structured log (with http_status)
+//   plus an analytics increment — no per-delivery D1 row.
+// - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
+//   Collapses each batch into one UPSERT per (webhook, day).
 //
 // This worker has no HTTP routes; `fetch` only exists so direct hits
 // return a clear 404 instead of a missing-handler error.
-
-const HANDLERS = {
-  "hooklane-events": processEvent,
-  "hooklane-deliveries": processDelivery,
-};
 
 export default {
   async fetch() {
@@ -26,7 +25,25 @@ export default {
   },
 
   async queue(batch, env, ctx) {
-    const handler = HANDLERS[batch.queue] || processEvent;
+    if (batch.queue === "hooklane-analytics") {
+      try {
+        await processAnalyticsBatch(batch.messages, env);
+        for (const message of batch.messages) message.ack();
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            msg: "analytics batch failed, retrying",
+            queue: batch.queue,
+            error: error?.message || String(error),
+          })
+        );
+        for (const message of batch.messages) message.retry();
+      }
+      return;
+    }
+
+    const handler = batch.queue === "hooklane-deliveries" ? processDelivery : processEvent;
     for (const message of batch.messages) {
       try {
         await handler(message.body, env, ctx);

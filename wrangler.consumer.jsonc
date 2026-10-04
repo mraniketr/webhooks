@@ -12,7 +12,8 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" }
+      { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" },
+      { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
     ],
     "consumers": [
       {
@@ -25,6 +26,12 @@
         "queue": "hooklane-deliveries",
         "max_batch_size": 10,
         "max_batch_timeout": 5,
+        "max_retries": 5
+      },
+      {
+        "queue": "hooklane-analytics",
+        "max_batch_size": 50,
+        "max_batch_timeout": 10,
         "max_retries": 5
       }
     ]

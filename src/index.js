@@ -1,6 +1,9 @@
 import { buildContext, evaluatePreAssignment, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
 
-const WEBHOOK_BODY_LIMIT = 256 * 1024;
+// Queue messages cap at 128 KiB — keep inbound bodies well under that so the
+// full event (payload + headers + query + envelope) fits in one message.
+// No per-event D1 write happens on ingest; the queues carry the event.
+const WEBHOOK_BODY_LIMIT = 100 * 1024;
 const RATE_LIMIT = 60;
 const RATE_PERIOD = 60;
 const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -134,10 +137,22 @@ async function apiJson(user, env, ttlMs, body, status = 200) {
 }
 
 function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at }; }
+// Aggregate-only analytics: counts come from webhook_counters (maintained
+// async by the analytics queue), never from per-event rows.
 function webhookView(w, request) {
   return { id: w.id, name: w.name, token: w.token, status: w.status, created_at: w.created_at,
-    events: Number(w.events ?? 0), processed: Number(w.processed ?? 0), failed: Number(w.failed ?? 0),
+    events: Number(w.received ?? 0), processed: Number(w.processed ?? 0), failed: Number(w.delivered_failed ?? 0),
+    delivered_ok: Number(w.delivered_ok ?? 0),
     url: `${new URL(request.url).origin}/webhooks/${w.token}` };
+}
+
+function emptySampleContext() {
+  const empty = buildContext(null, null, { enriched: true, userId: 123 });
+  // Representative seed so the variable picker is useful pre-traffic.
+  empty.body = { event: "user.created", user: { id: 123, email: "jane@example.com" } };
+  empty.headers = { "content-type": "application/json", "x-api-key": "… " };
+  empty.query = { token: "…" };
+  return empty;
 }
 
 function normalizeActions(input) {
@@ -217,12 +232,6 @@ async function ensureSubscriptionColumns(env) {
     if (!names.has("payload_mode")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_mode TEXT DEFAULT 'passthrough'").run();
     if (!names.has("payload_template")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_template TEXT").run();
   } catch { /* D1 may disallow PRAGMA in some contexts — callers fall back */ }
-  try {
-    const ecols = await env.DB.prepare("PRAGMA table_info(events)").all();
-    const enames = new Set((ecols.results || []).map((c) => c.name));
-    if (!enames.has("query_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN query_json TEXT").run();
-    if (!enames.has("pre_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN pre_json TEXT").run();
-  } catch { /* ignore */ }
 }
 
 async function saveSubscriptions(env, wid, subs) {
@@ -310,22 +319,12 @@ async function mergeSubscriptions(env, wid, input) {
 }
 
 async function sampleContextForWebhook(env, wid) {
-  const webhook = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(wid).first();
-  let eventRow = null;
-  try {
-    eventRow = await env.DB.prepare("SELECT * FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
-  } catch {
-    eventRow = await env.DB.prepare("SELECT id,webhook_id,method,headers_json,payload_json,raw_body,ip,received_at FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
-  }
-  if (!eventRow) {
-    const empty = buildContext(null, webhook, { enriched: true, userId: 123 });
-    // Seed with a representative body so the variable picker is useful pre-traffic.
-    empty.body = { event: "user.created", user: { id: 123, email: "jane@example.com" } };
-    empty.headers = { "content-type": "application/json", "x-api-key": "… " };
-    empty.query = { token: "…" };
-    return { context: empty, hasSample: false };
-  }
-  return { context: buildContext(eventRow, webhook), hasSample: true, eventId: eventRow.id };
+  // Per-event rows are no longer stored — always return the seeded sample.
+  // (Preview/probe rendering uses this; live traffic renders per message.)
+  const webhook = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(wid).first().catch(() => null);
+  const ctx = emptySampleContext();
+  if (webhook) ctx.webhook = { id: webhook.id, name: webhook.name || "" };
+  return { context: ctx, hasSample: false };
 }
 function parsePayload(request, raw) {
   if (!raw) return null;
@@ -415,26 +414,29 @@ export default {
         }
 
         if (request.method === "GET" && p === "/api/dashboard") {
-          const stats = await env.DB.prepare(`SELECT COUNT(*) total,
-            SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
-            SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) failed,
-            SUM(CASE WHEN e.status='accepted' THEN 1 ELSE 0 END) pending
-            FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE w.user_id=?`).bind(user.id).first();
-          const hooks = await env.DB.prepare(`SELECT w.*, COUNT(e.id) events,
-            SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
-            SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) failed
-            FROM webhooks w LEFT JOIN events e ON e.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
-          const recent = await env.DB.prepare(`SELECT e.id,e.method,e.status,e.received_at,w.name webhook_name
-            FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE w.user_id=? ORDER BY e.id DESC LIMIT 8`).bind(user.id).all();
-          return apiJson(user, env, ttlMs, { stats: { total: Number(stats.total || 0), processed: Number(stats.processed || 0), failed: Number(stats.failed || 0), pending: Number(stats.pending || 0) },
-            webhooks: hooks.results.map(w => webhookView(w, request)), recent: recent.results });
+          // Aggregate-only: totals from webhook_counters. Per-event history
+          // lives in worker logs (observability), not in D1.
+          const sums = await env.DB.prepare(`SELECT
+            COALESCE(SUM(c.received),0) received,
+            COALESCE(SUM(c.processed),0) processed,
+            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
+            COALESCE(SUM(c.delivered_failed),0) delivered_failed
+            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=?`).bind(user.id).first().catch(() => null);
+          const hooks = await env.DB.prepare(`SELECT w.*,
+            COALESCE(c.received,0) received, COALESCE(c.processed,0) processed,
+            COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
+            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
+          const received = Number(sums?.received || 0), processed = Number(sums?.processed || 0);
+          const failed = Number(sums?.delivered_failed || 0);
+          return apiJson(user, env, ttlMs, { stats: { total: received, processed, failed, pending: Math.max(0, received - processed), delivered_ok: Number(sums?.delivered_ok || 0) },
+            webhooks: hooks.results.map(w => webhookView(w, request)) });
         }
 
         if (request.method === "GET" && p === "/api/webhooks") {
-          const rows = await env.DB.prepare(`SELECT w.*, COUNT(e.id) events,
-            SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
-            SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) failed
-            FROM webhooks w LEFT JOIN events e ON e.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
+          const rows = await env.DB.prepare(`SELECT w.*,
+            COALESCE(c.received,0) received, COALESCE(c.processed,0) processed,
+            COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
+            FROM webhooks w LEFT JOIN webhook_counters c ON c.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
           return apiJson(user, env, ttlMs, { webhooks: rows.results.map(w => webhookView(w, request)) });
         }
 
@@ -482,43 +484,14 @@ export default {
           const wid = Number(hookIdMatch[1]);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           if (!w) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const stats = await env.DB.prepare(`SELECT COUNT(*) total,
-            SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) processed,
-            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
-            SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) pending
-            FROM events WHERE webhook_id=?`).bind(wid).first();
+          const stats = await env.DB.prepare(`SELECT COALESCE(received,0) received, COALESCE(processed,0) processed,
+            COALESCE(delivered_ok,0) delivered_ok, COALESCE(delivered_failed,0) delivered_failed
+            FROM webhook_counters WHERE webhook_id=?`).bind(wid).first().catch(() => null);
           const rel = await webhookRelations(env, wid);
-          return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), stats, actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
-        }
-
-        const eventsMatch = p.match(/^\/api\/webhooks\/(\d+)\/events$/);
-        if (request.method === "GET" && eventsMatch) {
-          const wid = Number(eventsMatch[1]);
-          const owns = await env.DB.prepare("SELECT id FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
-          if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 25)));
-          const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
-          const rows = await env.DB.prepare(`SELECT e.id,e.method,e.ip,e.status,e.error,e.received_at,e.processed_at,
-            substr(COALESCE(e.payload_json,e.raw_body,''),1,140) payload_preview
-            FROM events e WHERE e.webhook_id=? ORDER BY e.id DESC LIMIT ? OFFSET ?`).bind(wid, limit, offset).all();
-          const total = await env.DB.prepare("SELECT COUNT(*) count FROM events WHERE webhook_id=?").bind(wid).first();
-          return apiJson(user, env, ttlMs, { events: rows.results, total: Number(total.count || 0) });
-        }
-
-        const eventMatch = p.match(/^\/api\/events\/(\d+)$/);
-        if (request.method === "GET" && eventMatch) {
-          const event = await env.DB.prepare(`SELECT e.*,w.name webhook_name,w.token
-            FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE e.id=? AND w.user_id=?`).bind(Number(eventMatch[1]), user.id).first();
-          if (!event) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const deliveries = await env.DB.prepare(`SELECT d.id,d.subscription_id,d.target_url,d.status,d.attempts,d.http_status,
-            d.response_preview,d.error,d.created_at,d.completed_at,s.name subscription_name
-            FROM deliveries d LEFT JOIN subscriptions s ON s.id=d.subscription_id
-            WHERE d.event_id=? ORDER BY d.id`).bind(event.id).all();
-          let query = {};
-          try { query = JSON.parse(event.query_json || "{}"); } catch { query = {}; }
-          let pre = [];
-          try { pre = event.pre_json ? JSON.parse(event.pre_json) : []; if (!Array.isArray(pre)) pre = []; } catch { pre = []; }
-          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), query, pre, payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
+          const received = Number(stats?.received || 0), processed = Number(stats?.processed || 0);
+          return apiJson(user, env, ttlMs, { webhook: webhookView({ ...w, received, processed, delivered_ok: Number(stats?.delivered_ok || 0), delivered_failed: Number(stats?.delivered_failed || 0) }, request),
+            stats: { total: received, processed, failed: Number(stats?.delivered_failed || 0), pending: Math.max(0, received - processed), delivered_ok: Number(stats?.delivered_ok || 0) },
+            actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
         }
 
         const contextMatch = p.match(/^\/api\/webhooks\/(\d+)\/context$/);
@@ -539,23 +512,11 @@ export default {
           const normalized = normalizeSubscriptions([b.subscription || b]);
           if (!normalized || !normalized.length) return apiJson(user, env, ttlMs, { error: "Provide a valid target_url template" }, 400);
           const sub = normalized[0];
-          let eventRow = null;
-          const eventId = Number(b.eventId || b.event_id || 0);
-          if (eventId) {
-            eventRow = await env.DB.prepare("SELECT * FROM events WHERE id=? AND webhook_id=?").bind(eventId, wid).first()
-              .catch(() => null);
-            if (!eventRow) return apiJson(user, env, ttlMs, { error: "Event not found for this webhook" }, 404);
-          } else {
-            try {
-              eventRow = await env.DB.prepare("SELECT * FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
-            } catch {
-              eventRow = null;
-            }
-          }
-          const baseCtx = eventRow
-            ? buildContext(eventRow, owns, {})
-            : { ...(await sampleContextForWebhook(env, wid)).context, pre: {} };
-          let ctx = eventRow ? buildContext(eventRow, owns) : baseCtx;
+          // No stored events in aggregate-only mode — preview renders
+          // against the seeded sample context plus the live pre-action.
+          const { context: sampleCtx } = await sampleContextForWebhook(env, wid);
+          const baseCtx = { ...sampleCtx, webhook: { id: owns.id, name: owns.name || "" } };
+          let ctx = baseCtx;
           let preError = null;
           try {
             const action = await env.DB.prepare("SELECT code FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order,id LIMIT 1").bind(wid).first();
@@ -564,7 +525,7 @@ export default {
               if (r.error) {
                 preError = r.error;
               } else {
-                ctx = eventRow ? buildContext(eventRow, owns, r.pre) : { ...baseCtx, pre: r.pre };
+                ctx = { ...baseCtx, pre: r.pre };
               }
             }
           } catch { /* fall back to ctx above */ }
@@ -583,25 +544,35 @@ export default {
         const raw = await readBody(request);
         const payload = parsePayload(request, raw);
         const received = now();
-        const headers = Object.fromEntries(request.headers.entries());
-        const ip = request.headers.get("cf-connecting-ip") || "";
-        const query = Object.fromEntries(url.searchParams.entries());
-        const queryJson = JSON.stringify(query);
-        let insert;
-        try {
-          insert = await env.DB.prepare(`INSERT INTO events
-            (webhook_id,method,headers_json,query_json,payload_json,raw_body,ip,status,received_at)
-            VALUES (?,?,?,?,?,?,?,?,?)`)
-            .bind(hook.id, request.method, JSON.stringify(headers), queryJson, payload == null ? null : JSON.stringify(payload), raw, ip, "accepted", received).run();
-        } catch {
-          insert = await env.DB.prepare(`INSERT INTO events
-            (webhook_id,method,headers_json,payload_json,raw_body,ip,status,received_at)
-            VALUES (?,?,?,?,?,?,?,?)`)
-            .bind(hook.id, request.method, JSON.stringify(headers), payload == null ? null : JSON.stringify(payload), raw, ip, "accepted", received).run();
-        }
-        const eventId = insert.meta.last_row_id;
-        await env.WEBHOOK_QUEUE.send({ eventId: Number(eventId) });
-        return json({ accepted: true, eventId: Number(eventId), status: "queued" }, 202);
+        // No D1 write on ingest — the event travels in the queue message.
+        // Status is observed via structured worker logs; counts accumulate
+        // async through the analytics queue (ctx.waitUntil, off the hot path).
+        const eventId = crypto.randomUUID();
+        const eventMessage = {
+          eventId,
+          webhookId: hook.id,
+          method: request.method,
+          headers: Object.fromEntries(request.headers.entries()),
+          query: Object.fromEntries(url.searchParams.entries()),
+          payload,
+          rawBody: raw,
+          ip: request.headers.get("cf-connecting-ip") || "",
+          receivedAt: received,
+        };
+        await env.WEBHOOK_QUEUE.send(eventMessage);
+        ctx.waitUntil((async () => {
+          try {
+            if (env.ANALYTICS_QUEUE) {
+              await env.ANALYTICS_QUEUE.send({
+                webhookId: hook.id, field: "received", count: 1,
+                day: received.slice(0, 10),
+              });
+            }
+          } catch (e) {
+            console.error(JSON.stringify({ level: "error", msg: "analytics enqueue failed", webhookId: hook.id, error: e?.message || String(e) }));
+          }
+        })());
+        return json({ accepted: true, eventId, status: "queued" }, 202);
       }
 
       return env.ASSETS.fetch(request);

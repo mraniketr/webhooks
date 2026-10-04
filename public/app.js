@@ -192,7 +192,7 @@ function headerEditorRow(k = '', v = '') {
 function renderSubList() {
   const box = $('#subList');
   if (!editingSubs.length) {
-    box.innerHTML = '<div class="empty">No subscriptions yet. Add one — events will be stored only until then.</div>';
+    box.innerHTML = '<div class="empty">No subscriptions yet. Add one to start forwarding events.</div>';
     return;
   }
   box.innerHTML = '';
@@ -319,7 +319,7 @@ function toggleSubVarPanel() {
     ? `<div class="var-group"><div class="var-title">${title}</div>${items.map(v => `<button type="button" class="var-pill" data-var="${esc(v.variable)}" title="${esc(v.description || '')}${v.sample ? ' — e.g. ' + esc(String(v.sample)) : ''}">${esc(v.variable)}</button>`).join('')}</div>`
     : '';
   panel.innerHTML = `<div class="var-help">Click a variable to insert it into the last-focused URL / header / JSON field. Fallbacks: <code>{{ body.plan || "free" }}</code></div>`
-    + `<div class="var-note muted">${varCache.hasSample ? 'Values below come from your latest event.' : 'No events yet — showing example fields. Send a test event to see real body / header / query names.'}</div>`
+    + `<div class="var-note muted">Showing sample fields — per-event payloads are not stored. Variables resolve per event at delivery time.</div>`
     + group('Always available', vars.base) + group('From latest event', vars.dynamic);
   panel.classList.remove('hidden');
   panel.querySelectorAll('.var-pill').forEach(b => b.onclick = () => {
@@ -433,7 +433,6 @@ if (preEditForm) preEditForm.onsubmit = async e => {
   renderPreSummary();
   showPage('edit');
 };
-$('#closeEventModal').onclick = () => $('#eventModal').classList.add('hidden');
 $('#webhookForm').onsubmit = async e => {
   e.preventDefault();
   const body = { name: $('#webhookName').value.trim(), status: $('#webhookStatus').value, actions: collectActions(), subscriptions: editingSubs.filter(s => s.target_url).map(subToApi) };
@@ -448,13 +447,12 @@ $('#webhookForm').onsubmit = async e => {
   } catch (err) { toast(err.message, true); }
 };
 function renderStats(s) {
-  $('#statsGrid').innerHTML = [['Events', s.total || 0, 'All accepted deliveries'], ['Processed', s.processed || 0, 'Completed by worker'], ['Pending', s.pending || 0, 'Queued or in flight'], ['Failed', s.failed || 0, 'Needs attention']].map(([l, v, sub]) => `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join('');
+  $('#statsGrid').innerHTML = [['Events', s.total || 0, 'Accepted into the queue'], ['Processed', s.processed || 0, 'Pre-action ran, fanned out'], ['Pending', s.pending || 0, 'Queued or in flight'], ['Failed', s.failed || 0, 'Failed deliveries']].map(([l, v, sub]) => `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join('');
 }
 async function loadDashboard() {
   try {
     const d = await api('/api/dashboard');
     renderStats(d.stats);
-    $('#recentEvents').innerHTML = d.recent?.length ? `<table class="table"><thead><tr><th>ID</th><th>Webhook</th><th>Status</th><th>Received</th></tr></thead><tbody>${d.recent.map(x => `<tr class="clickable" onclick="viewEvent(${x.id})"><td class="mono">#${x.id}</td><td>${x.webhook_name}</td><td><span class="badge ${x.status}">${x.status}</span></td><td>${new Date(x.received_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No events yet. Send a POST to one of your webhook URLs.</div>';
     $('#dashboardWebhooks').innerHTML = d.webhooks?.length ? `<div class="hook-list">${d.webhooks.slice(0, 6).map(w => `<div class="hook-row"><div><strong>${esc(w.name)}</strong><small>${w.events || 0} events · ${w.status}</small></div><button class="ghost" onclick="openWebhook(${w.id})">Open</button></div>`).join('')}</div>` : '<div class="empty">Create your first webhook.</div>';
   } catch (err) { toast(err.message, true); }
 }
@@ -472,29 +470,16 @@ async function openWebhook(id) {
   try {
     const d = await api('/api/webhooks/' + id);
     currentWebhook = d.webhook;
-    const e = await api(`/api/webhooks/${id}/events?limit=25&offset=0`);
     $('#detailName').textContent = currentWebhook.name;
-    $('#detailSub').textContent = `${currentWebhook.url} · ${e.total} events`;
+    $('#detailSub').textContent = `${currentWebhook.url} · ${d.stats.total || 0} events received`;
     $('#webhookDetail').innerHTML = `<div class="detail-title"><div><div class="url-box"><code>${esc(currentWebhook.url)}</code><button type="button" class="ghost" onclick="copyWebhookUrl()">Copy URL</button></div><div class="curl-box"><div class="curl-head"><span>Test with curl</span><button type="button" class="ghost sm" onclick="copyWebhookCurl()">Copy curl</button></div><pre class="curl-code"><code>${esc(buildCurl(currentWebhook.url))}</code></pre></div></div></div>`
-      + `<div class="detail-stats">${[['Total', d.stats.total || 0], ['Processed', d.stats.processed || 0], ['Pending', d.stats.pending || 0], ['Failed', d.stats.failed || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
+      + `<div class="detail-stats">${[['Received', d.stats.total || 0], ['Processed', d.stats.processed || 0], ['Delivered', d.stats.delivered_ok || 0], ['Failed', d.stats.failed || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
       + `<div class="panel-head"><div><h3>Pre-action</h3><p>Sets a key-value <code>pre</code> object — subscriptions use <code>{{ pre.key }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? (() => { const a = d.actions[0]; return `<div class="action-item"><strong>${esc(a.name || 'Pre-action')}</strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`; })() : '<div class="empty">No pre-action configured.</div>'}</div>`
-      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`).join('') : '<div class="empty">No subscriptions — events are stored and processed only.</div>'}</div>`
-      + `<div class="panel-head" style="margin-top:18px"><div><h3>Events</h3><p>${e.total} total events</p></div></div><div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>Method</th><th>Status</th><th>Received</th><th>IP</th></tr></thead><tbody>${e.events.map(x => `<tr class="clickable" onclick="viewEvent(${x.id})"><td class="mono">#${x.id}</td><td>${x.method}</td><td><span class="badge ${x.status}">${x.status}</span></td><td>${new Date(x.received_at).toLocaleString()}</td><td class="mono">${esc(x.ip || '—')}</td></tr>`).join('')}</tbody></table></div>`;
-  } catch (err) { toast(err.message, true); }
-}
-async function viewEvent(id) {
-  try {
-    const d = await api('/api/events/' + id);
-    $('#eventTitle').textContent = `Event #${id} · ${d.event.status}`;
-    const e = { ...d.event }; delete e.headers_json; delete e.payload_json; delete e.raw_body; delete e.query_json; delete e.pre_json;
-    $('#eventJson').textContent = JSON.stringify({ id: e.id, webhook: e.webhook_name, status: e.status, receivedAt: e.received_at, processedAt: e.processed_at, ip: e.ip, headers: d.event.headers, query: d.event.query, payload: d.event.payload, pre: d.event.pre || {}, error: e.error }, null, 2);
-    const dl = d.deliveries || [];
-    $('#eventDeliveries').innerHTML = dl.length ? `<div class="panel-head" style="margin-top:14px"><div><h3>Deliveries</h3><p>${dl.length} subscription attempt${dl.length === 1 ? '' : 's'}</p></div></div><table class="table"><thead><tr><th>Target</th><th>Status</th><th>HTTP</th><th>Attempts</th><th>Error</th></tr></thead><tbody>${dl.map(x => `<tr><td><strong>${esc(x.subscription_name || '—')}</strong><br/><small class="mono">${esc(x.target_url)}</small></td><td><span class="badge ${x.status === 'success' ? 'processed' : 'failed'}">${x.status}</span></td><td class="mono">${x.http_status ?? '—'}</td><td class="mono">${x.attempts}</td><td><small>${esc(x.error || '—')}</small></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No subscription deliveries for this event.</div>';
-    $('#eventModal').classList.remove('hidden');
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => `<div class="action-item"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
   } catch (err) { toast(err.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }
-window.openWebhook = openWebhook; window.openEdit = openEdit; window.viewEvent = viewEvent;
+window.openWebhook = openWebhook; window.openEdit = openEdit;
 window.toast = toast; window.copyWebhookUrl = copyWebhookUrl; window.copyWebhookCurl = copyWebhookCurl;
 window.copyText = copyText; window.buildCurl = buildCurl;
 bootstrap();
