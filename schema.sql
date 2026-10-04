@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS events (
   webhook_id INTEGER NOT NULL,
   method TEXT NOT NULL,
   headers_json TEXT NOT NULL,
+  query_json TEXT,
   payload_json TEXT,
   raw_body TEXT,
   ip TEXT,
@@ -52,6 +53,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   target_url TEXT NOT NULL,
   secret TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
+  http_method TEXT NOT NULL DEFAULT 'POST',
+  headers_json TEXT,
+  payload_mode TEXT NOT NULL DEFAULT 'passthrough',
+  payload_template TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );

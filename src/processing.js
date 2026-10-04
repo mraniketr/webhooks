@@ -1,3 +1,5 @@
+import { buildContext, renderSubscription } from "./template.js";
+
 function now() {
   return new Date().toISOString();
 }
@@ -121,14 +123,31 @@ async function processDelivery(message, env, ctx) {
   if (row.status === "success") return;
 
   const attempt = row.attempts + 1;
-  const payload = eventRow.payload_json ? JSON.parse(eventRow.payload_json) : eventRow.raw_body;
-  const bodyText = payloadText(payload);
+  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(eventRow.webhook_id).first().catch(() => null);
+  const tplCtx = buildContext(eventRow, webhookRow);
+  const rendered = renderSubscription(sub, tplCtx);
+  // Sync the stored delivery URL with the rendered URL so history shows the real target.
+  if (rendered.url && rendered.url !== row.target_url) {
+    await env.DB.prepare("UPDATE deliveries SET target_url=? WHERE id=?").bind(rendered.url.slice(0, 2000), row.id).run();
+    row.target_url = rendered.url;
+  }
+  if (!rendered.url || rendered.errors.length && rendered.url === "") {
+    const message = rendered.errors[0] || "Subscription template rendered an empty URL";
+    await env.DB.prepare(
+      "UPDATE deliveries SET status='failed', attempts=?, http_status=?, response_preview=?, error=?, completed_at=? WHERE id=?"
+    )
+      .bind(attempt, null, null, message, now(), row.id)
+      .run();
+    throw new Error(`${sub.name}: ${message}`);
+  }
+  const bodyText = rendered.bodyText;
   const headers = {
     "content-type": "application/json",
     "X-Hooklane-Event-Id": String(eventId),
     "X-Hooklane-Webhook-Id": String(eventRow.webhook_id),
     "X-Hooklane-Delivery-Id": String(row.id),
     "X-Hooklane-Attempt": String(attempt),
+    ...rendered.headers,
   };
   if (sub.secret) {
     headers["X-Hooklane-Signature"] = "sha256=" + (await hmacHex(sub.secret, bodyText));
@@ -136,10 +155,10 @@ async function processDelivery(message, env, ctx) {
 
   let outcome;
   try {
-    const res = await fetch(sub.target_url, {
-      method: "POST",
+    const res = await fetch(rendered.url, {
+      method: rendered.method || "POST",
       headers,
-      body: bodyText,
+      body: ["POST", "PUT", "PATCH"].includes(rendered.method) ? bodyText : undefined,
       signal: AbortSignal.timeout(10000),
     });
     const preview = await res.text().catch(() => "");

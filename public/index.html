@@ -53,20 +53,21 @@
       <div class="panel"><div class="panel-head"><div><h3>Endpoints</h3><p>Create isolated webhook URLs with configurable processing actions.</p></div><button class="primary" id="newWebhookBtn3">＋ New webhook</button></div><div id="webhooksTable" class="table-wrap"></div></div>
       <div id="webhookDetail" class="panel detail-panel hidden"></div>
     </section>
+    <section id="page-edit" class="page hidden">
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow" id="editEyebrow">NEW ENDPOINT</div><h3 id="editTitle">Create webhook</h3><p>Configure processing actions and templated subscriptions.</p></div><button class="ghost" id="backToWebhooks">← Back</button></div>
+      <form id="webhookForm">
+        <div class="field"><label>Webhook name</label><input id="webhookName" placeholder="Stripe events" required/></div>
+        <div class="field"><label>Status</label><select id="webhookStatus"><option value="active">active</option><option value="disabled">disabled</option></select></div>
+        <div class="subhead"><span>Actions <small class="muted">JS scripts, run in order</small></span><button type="button" class="ghost sm" id="addActionBtn">+ Add action</button></div>
+        <div id="actionRows"></div>
+        <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
+        <div id="subRows"></div>
+        <div class="callout"><b>Pipeline:</b> event is persisted, pre-actions run, payload is forwarded to each enabled subscription, then post-actions run. Deliveries are logged per event.</div>
+        <div class="modal-actions"><button type="button" class="ghost" id="cancelEdit">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
+      </form></div>
+    </section>
   </main>
 </div>
-
-<div id="modal" class="modal hidden"><div class="modal-card wide"><div class="modal-head"><div><div class="eyebrow" id="modalEyebrow">NEW ENDPOINT</div><h3 id="modalTitle">Create webhook</h3></div><button class="close" id="closeModal">×</button></div>
-<form id="webhookForm">
-  <div class="field"><label>Webhook name</label><input id="webhookName" placeholder="Stripe events" required/></div>
-  <div class="field"><label>Status</label><select id="webhookStatus"><option value="active">active</option><option value="disabled">disabled</option></select></div>
-  <div class="subhead"><span>Actions <small class="muted">JS scripts, run in order</small></span><button type="button" class="ghost sm" id="addActionBtn">+ Add action</button></div>
-  <div id="actionRows"></div>
-  <div class="subhead"><span>Subscriptions <small class="muted">forward events to URLs</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
-  <div id="subRows"></div>
-  <div class="callout"><b>Pipeline:</b> event is persisted, pre-actions run, payload is forwarded to each enabled subscription, then post-actions run. Deliveries are logged per event.</div>
-  <div class="modal-actions"><button type="button" class="ghost" id="cancelModal">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
-</form></div></div>
 
 <div id="eventModal" class="modal hidden"><div class="modal-card wide"><div class="modal-head"><div><div class="eyebrow">EVENT</div><h3 id="eventTitle">Event</h3></div><button class="close" id="closeEventModal">×</button></div><pre id="eventJson" class="code-block"></pre><div id="eventDeliveries"></div></div></div>
 <script src="/app.js"></script>
