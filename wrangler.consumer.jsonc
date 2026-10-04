@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "webhooks-consumer",
+  "main": "src/consumer.js",
+  "compatibility_date": "2026-10-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hooklane-db"
+    }
+  ],
+  "queues": {
+    "consumers": [
+      {
+        "queue": "hooklane-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5
+      }
+    ]
+  },
+  "observability": { "enabled": true }
+}

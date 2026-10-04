@@ -5,7 +5,10 @@
   "description": "Async webhook service for Cloudflare Workers, D1, Queues and Dynamic Workers",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:consumer": "wrangler dev --config wrangler.consumer.jsonc",
     "deploy": "wrangler deploy",
+    "deploy:consumer": "wrangler deploy --config wrangler.consumer.jsonc",
+    "deploy:all": "wrangler deploy && wrangler deploy --config wrangler.consumer.jsonc",
     "db:init": "wrangler d1 execute hooklane-db --remote --file=./schema.sql"
   },
   "devDependencies": {
