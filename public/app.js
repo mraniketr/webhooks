@@ -2,6 +2,8 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 let authMode = 'login', currentPage = 'dashboard', currentWebhook = null, user = null;
 let editingId = null;
+let editingSubs = [];
+let editingSubIndex = null; // null | number ('new' uses -1)
 let varCache = { wid: null, variables: null, hasSample: false };
 let lastTemplateField = null;
 
@@ -34,6 +36,7 @@ function showPage(page) {
     dashboard: ['Overview', 'Webhook health at a glance'],
     webhooks: ['Webhooks', 'Endpoints and event streams'],
     edit: ['Webhooks', 'Create or edit endpoint'],
+    subedit: ['Webhooks', 'Edit one subscription'],
   };
   const [eyebrow, title] = titles[page] || titles.webhooks;
   $('#pageEyebrow').textContent = eyebrow;
@@ -66,29 +69,48 @@ $('#authForm').onsubmit = async e => {
 $('#logoutBtn').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); user = null; showAuth(); };
 $$('[data-page]').forEach(b => b.onclick = () => showPage(b.dataset.page));
 
+function normalizeSubForEditor(s = {}) {
+  let headers = s.headers && typeof s.headers === 'object' ? s.headers
+    : (() => { try { return JSON.parse(s.headers_json || '{}'); } catch { return {}; } })();
+  return {
+    id: s.id || undefined,
+    name: s.name || '',
+    http_method: s.http_method || s.method || 'POST',
+    enabled: (s.enabled ?? 1) ? 1 : 0,
+    target_url: s.target_url || '',
+    secret: '',
+    has_secret: s.has_secret ? 1 : 0,
+    headers: headers || {},
+    payload_mode: s.payload_mode || 'passthrough',
+    payload_template: s.payload_template || '',
+  };
+}
 function openCreate() {
   editingId = null; varCache = { wid: null, variables: null, hasSample: false };
+  editingSubs = []; editingSubIndex = null;
   $('#editEyebrow').textContent = 'NEW ENDPOINT';
   $('#editTitle').textContent = 'Create webhook';
   $('#webhookSubmit').textContent = 'Create webhook';
   $('#webhookName').value = ''; $('#webhookStatus').value = 'active';
-  $('#actionRows').innerHTML = ''; $('#subRows').innerHTML = '';
+  $('#actionRows').innerHTML = '';
   $('#actionRows').append(actionRow({ phase: 'pre' }));
-  $('#subRows').append(subRow({}));
+  renderSubList();
   showPage('edit');
 }
 async function openEdit(id) {
   try {
     const d = await api('/api/webhooks/' + id);
     editingId = id; varCache = { wid: null, variables: null, hasSample: false };
+    editingSubIndex = null;
     $('#editEyebrow').textContent = 'EDIT ENDPOINT';
     $('#editTitle').textContent = 'Edit webhook';
     $('#webhookSubmit').textContent = 'Save changes';
     $('#webhookName').value = d.webhook.name;
     $('#webhookStatus').value = d.webhook.status || 'active';
-    $('#actionRows').innerHTML = ''; $('#subRows').innerHTML = '';
+    $('#actionRows').innerHTML = '';
     (d.actions.length ? d.actions : [{}]).forEach(a => $('#actionRows').append(actionRow(a)));
-    (d.subscriptions.length ? d.subscriptions : [{}]).forEach(s => $('#subRows').append(subRow(s)));
+    editingSubs = (d.subscriptions || []).map(normalizeSubForEditor);
+    renderSubList();
     showPage('edit');
     loadVariables(id);
   } catch (err) { toast(err.message, true); }
@@ -123,45 +145,100 @@ function headerEditorRow(k = '', v = '') {
   return r;
 }
 
-function subRow(s = {}) {
-  const d = document.createElement('div');
-  d.className = 'row-card sub-card'; d.dataset.id = s.id || '';
-  const headers = s.headers && typeof s.headers === 'object' ? s.headers
-    : (() => { try { return JSON.parse(s.headers_json || '{}'); } catch { return {}; } })();
-  d.innerHTML = `
-    <div class="row-grid three">
-      <input data-k="name" placeholder="Subscription name" maxlength="100"/>
-      <select data-k="http_method"><option value="POST">POST</option><option value="PUT">PUT</option><option value="PATCH">PATCH</option><option value="DELETE">DELETE</option></select>
-      <select data-k="enabled"><option value="1">enabled</option><option value="0">disabled</option></select>
-    </div>
-    <input data-k="target_url" placeholder="https://example.com/hooks/{{ body.tenant_id }}?token={{ query.token }}" inputmode="url" class="tpl-field"/>
-    <div class="hint">URL supports <code>{{ }}</code> variables — e.g. <code>{{ body.user.id }}</code>, <code>{{ query.token }}</code>, <code>{{ headers.x-tenant }}</code></div>
-    <div class="row-grid"><input data-k="secret" type="password" placeholder="Signing secret (optional)" autocomplete="off"/><select data-k="payload_mode"><option value="passthrough">passthrough body</option><option value="custom">custom JSON body</option></select></div>
-    <div class="hdr-head"><span>Custom headers <small class="muted">values support {{ }} too</small></span><button type="button" class="ghost sm" data-act="add-hdr">+ Header</button></div>
-    <div data-k="headers-box"></div>
-    <div data-k="payload-wrap"><textarea data-k="payload_template" class="tpl-field code" placeholder='{\n  "userId": "{{ body.user.id }}",\n  "plan": "{{ body.plan || \\"free\\" }}"\n}'></textarea>
-    <div class="hint">Custom JSON body with variables. Choose <b>passthrough</b> to forward the event body unchanged.</div></div>
-    <div class="sub-tools"><button type="button" class="ghost sm" data-act="vars">Variables</button><button type="button" class="ghost sm" data-act="preview">Preview render</button><span class="muted">${s.has_secret ? 'Has signing secret — leave blank to keep' : ''}</span><button type="button" class="link-danger" data-act="remove">Remove</button></div>
-    <div class="var-panel hidden" data-k="var-panel"></div>
-    <div class="preview-box hidden" data-k="preview-box"></div>`;
-  d.querySelector('[data-k="name"]').value = s.name || '';
-  d.querySelector('[data-k="http_method"]').value = s.http_method || s.method || 'POST';
-  d.querySelector('[data-k="enabled"]').value = String(s.enabled ?? 1);
-  d.querySelector('[data-k="target_url"]').value = s.target_url || '';
-  d.querySelector('[data-k="secret"]').value = '';
-  d.querySelector('[data-k="payload_mode"]').value = s.payload_mode || 'passthrough';
-  d.querySelector('[data-k="payload_template"]').value = s.payload_template || '';
-  const box = d.querySelector('[data-k="headers-box"]');
-  const entries = Object.entries(headers || {});
-  (entries.length ? entries : [['', '']]).forEach(([k, v]) => box.append(headerEditorRow(k, v)));
-  const syncMode = () => { d.querySelector('[data-k="payload-wrap"]').style.display = d.querySelector('[data-k="payload_mode"]').value === 'custom' ? '' : 'none'; };
-  d.querySelector('[data-k="payload_mode"]').onchange = syncMode; syncMode();
-  d.querySelectorAll('.tpl-field').forEach(el => el.addEventListener('focus', e => lastTemplateField = e.target));
-  d.querySelector('[data-act="add-hdr"]').onclick = () => box.append(headerEditorRow('', ''));
-  d.querySelector('[data-act="remove"]').onclick = () => d.remove();
-  d.querySelector('[data-act="vars"]').onclick = () => toggleVarPanel(d);
-  d.querySelector('[data-act="preview"]').onclick = () => previewSubscription(d);
-  return d;
+function renderSubList() {
+  const box = $('#subList');
+  if (!editingSubs.length) {
+    box.innerHTML = '<div class="empty">No subscriptions yet. Add one — events will be stored only until then.</div>';
+    return;
+  }
+  box.innerHTML = '';
+  editingSubs.forEach((s, i) => {
+    const hdrCount = s.headers ? Object.keys(s.headers).length : 0;
+    const row = document.createElement('div');
+    row.className = 'hook-row sub-list-row';
+    row.innerHTML = `<div><strong>${esc(s.name || s.target_url || 'Untitled subscription')}</strong>`
+      + `<small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url || '—')}</small>`
+      + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}</small></div>`
+      + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
+    row.querySelector('button').onclick = () => openSubEditor(i);
+    box.append(row);
+  });
+}
+
+function syncSubPayloadMode() {
+  $('#subPayloadWrap').style.display = $('#subPayloadMode').value === 'custom' ? '' : 'none';
+}
+
+function openSubEditor(index) {
+  editingSubIndex = index;
+  const isNew = index === -1;
+  const s = isNew ? normalizeSubForEditor({}) : editingSubs[index];
+  if (!s) return;
+  $('#subEditEyebrow').textContent = isNew ? 'NEW SUBSCRIPTION' : 'EDIT SUBSCRIPTION';
+  $('#subEditTitle').textContent = isNew ? 'Add subscription' : (s.name || 'Edit subscription');
+  $('#subEditSub').textContent = isNew
+    ? 'Configure one subscription. It is added to the list when you save.'
+    : 'Edit one subscription. Nothing else changes until you save.';
+  $('#subSaveBtn').textContent = isNew ? 'Add subscription' : 'Save subscription';
+  $('#subName').value = s.name || '';
+  $('#subMethod').value = s.http_method || 'POST';
+  $('#subEnabled').value = String(s.enabled ?? 1);
+  $('#subPayloadMode').value = s.payload_mode || 'passthrough';
+  $('#subTargetUrl').value = s.target_url || '';
+  $('#subSecret').value = '';
+  $('#subSecretHint').textContent = s.has_secret ? 'has secret — leave blank to keep' : 'optional';
+  $('#subPayloadTemplate').value = s.payload_template || '';
+  const hb = $('#subHeadersBox');
+  hb.innerHTML = '';
+  const entries = Object.entries(s.headers || {});
+  (entries.length ? entries : [['', '']]).forEach(([k, v]) => hb.append(headerEditorRow(k, v)));
+  syncSubPayloadMode();
+  $('#subVarPanel').classList.add('hidden');
+  $('#subPreviewBox').classList.add('hidden');
+  $('#subPreviewBox').innerHTML = '';
+  showPage('subedit');
+}
+
+function closeSubEditor() {
+  editingSubIndex = null;
+  showPage('edit');
+}
+
+function collectSubEditor() {
+  const headers = {};
+  document.querySelectorAll('#subHeadersBox .hdr-row').forEach(r => {
+    const k = r.querySelector('[data-hk]').value.trim();
+    const v = r.querySelector('[data-hv]').value;
+    if (k) headers[k] = v;
+  });
+  const mode = $('#subPayloadMode').value === 'custom' ? 'custom' : 'passthrough';
+  const prev = editingSubIndex !== -1 && editingSubs[editingSubIndex] ? editingSubs[editingSubIndex] : {};
+  return {
+    id: prev.id || undefined,
+    name: $('#subName').value.trim() || $('#subTargetUrl').value.trim(),
+    http_method: $('#subMethod').value,
+    enabled: $('#subEnabled').value !== '0' ? 1 : 0,
+    target_url: $('#subTargetUrl').value.trim(),
+    secret: $('#subSecret').value,
+    has_secret: prev.has_secret || 0,
+    headers,
+    payload_mode: mode,
+    payload_template: mode === 'custom' ? $('#subPayloadTemplate').value : '',
+  };
+}
+
+function subToApi(s) {
+  return {
+    id: s.id || undefined,
+    name: s.name,
+    enabled: s.enabled ? true : s.enabled !== 0,
+    http_method: s.http_method,
+    target_url: s.target_url,
+    secret: s.secret || '',
+    headers: s.headers || {},
+    payload_mode: s.payload_mode,
+    payload_template: s.payload_mode === 'custom' ? (s.payload_template || '') : undefined,
+  };
 }
 
 async function loadVariables(wid) {
@@ -188,8 +265,8 @@ function fallbackVariables() {
   };
 }
 
-function toggleVarPanel(card) {
-  const panel = card.querySelector('[data-k="var-panel"]');
+function toggleSubVarPanel() {
+  const panel = $('#subVarPanel');
   const vars = varCache.variables || fallbackVariables();
   if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
   const group = (title, items) => items?.length
@@ -201,7 +278,8 @@ function toggleVarPanel(card) {
   panel.classList.remove('hidden');
   panel.querySelectorAll('.var-pill').forEach(b => b.onclick = () => {
     const v = b.dataset.var;
-    if (lastTemplateField && card.contains(lastTemplateField)) {
+    const scope = $('#page-subedit');
+    if (lastTemplateField && scope.contains(lastTemplateField)) {
       const el = lastTemplateField;
       const start = el.selectionStart ?? el.value.length;
       el.value = el.value.slice(0, start) + v + el.value.slice(el.selectionEnd ?? start);
@@ -212,48 +290,25 @@ function toggleVarPanel(card) {
   });
 }
 
-function collectSub(card) {
-  const g = k => card.querySelector('[data-k="' + k + '"]').value;
-  const headers = {};
-  card.querySelectorAll('.hdr-row').forEach(r => {
-    const k = r.querySelector('[data-hk]').value.trim();
-    const v = r.querySelector('[data-hv]').value;
-    if (k) headers[k] = v;
-  });
-  const mode = card.querySelector('[data-k="payload_mode"]').value === 'custom' ? 'custom' : 'passthrough';
-  return {
-    id: card.dataset.id || undefined,
-    name: g('name').trim(),
-    enabled: g('enabled') !== '0',
-    http_method: card.querySelector('[data-k="http_method"]').value,
-    target_url: g('target_url').trim(),
-    secret: g('secret'),
-    headers,
-    payload_mode: mode,
-    payload_template: mode === 'custom' ? card.querySelector('[data-k="payload_template"]').value : undefined,
-  };
-}
-
-function collect(box, kind) {
-  return [...box.children].map(c => {
-    if (kind === 'sub') return collectSub(c);
+function collectActions() {
+  return [...$('#actionRows').children].map(c => {
     const g = k => c.querySelector('[data-k="' + k + '"]').value;
     return { id: c.dataset.id || undefined, name: g('name').trim(), enabled: g('enabled') !== '0', phase: g('phase'), code: g('code') };
-  }).filter(kind === 'action' ? o => o.code.trim() : o => o.target_url);
+  }).filter(o => o.code.trim());
 }
 
-async function previewSubscription(card) {
-  const box = card.querySelector('[data-k="preview-box"]');
+async function previewSingleSubscription() {
+  const box = $('#subPreviewBox');
   box.classList.remove('hidden');
   box.innerHTML = '<div class="muted">Rendering…</div>';
-  const sub = collectSub(card);
+  const sub = collectSubEditor();
   if (!sub.target_url) { box.innerHTML = '<div class="preview-err">Enter a target URL first.</div>'; return; }
   if (!editingId) {
     box.innerHTML = '<div class="muted">Save the webhook first, then preview renders against the latest event. URL / header <code>{{ }}</code> variables will be resolved per event at delivery time.</div>';
     return;
   }
   try {
-    const d = await api('/api/webhooks/' + editingId + '/subscriptions/preview', { method: 'POST', body: JSON.stringify({ subscription: sub }) });
+    const d = await api('/api/webhooks/' + editingId + '/subscriptions/preview', { method: 'POST', body: JSON.stringify({ subscription: subToApi(sub) }) });
     const r = d.rendered;
     box.innerHTML = `${r.errors?.length ? `<div class="preview-err">${r.errors.map(esc).join('<br/>')}</div>` : '<div class="preview-ok">Rendered OK</div>'}`
       + `<div class="preview-grid"><div><span>METHOD</span><code>${esc(r.method)}</code></div><div><span>URL</span><code>${esc(r.url)}</code></div></div>`
@@ -262,15 +317,58 @@ async function previewSubscription(card) {
   } catch (err) { box.innerHTML = `<div class="preview-err">${esc(err.message)}</div>`; }
 }
 
+async function persistSubscriptionsAfterSubSave() {
+  // One-by-one UX with immediate persistence for existing webhooks.
+  // Include current name/status/actions so unsaved edits elsewhere aren't lost.
+  if (!editingId) return null;
+  const payload = {
+    name: $('#webhookName').value.trim() || undefined,
+    status: $('#webhookStatus').value,
+    actions: collectActions(),
+    subscriptions: editingSubs.filter(s => s.target_url).map(subToApi),
+  };
+  return api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(payload) });
+}
+
 ['#newWebhookBtn', '#newWebhookBtn2', '#newWebhookBtn3'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
 $('#addActionBtn').onclick = () => $('#actionRows').append(actionRow({}));
-$('#addSubBtn').onclick = () => $('#subRows').append(subRow({}));
+$('#addSubBtn').onclick = () => openSubEditor(-1);
 $('#cancelEdit').onclick = cancelEdit;
 $('#backToWebhooks').onclick = cancelEdit;
+$('#backToEdit').onclick = closeSubEditor;
+$('#cancelSubEdit').onclick = closeSubEditor;
+$('#subAddHdr').onclick = () => $('#subHeadersBox').append(headerEditorRow('', ''));
+$('#subPayloadMode').onchange = syncSubPayloadMode;
+$('#subVarsBtn').onclick = toggleSubVarPanel;
+$('#subPreviewBtn').onclick = previewSingleSubscription;
+['#subTargetUrl', '#subPayloadTemplate'].forEach(id => { const el = $(id); if (el) el.addEventListener('focus', e => lastTemplateField = e.target); });
+$('#subEditForm').onsubmit = async e => {
+  e.preventDefault();
+  const draft = collectSubEditor();
+  if (!draft.target_url) { toast('Target URL is required', true); return; }
+  try {
+    if (editingSubIndex === -1) {
+      editingSubs.push({ ...draft, secret: draft.secret || '', has_secret: draft.secret ? 1 : 0 });
+    } else {
+      const prev = editingSubs[editingSubIndex] || {};
+      editingSubs[editingSubIndex] = { ...draft, id: prev.id, has_secret: draft.secret ? 1 : (prev.has_secret || 0) };
+    }
+    if (editingId) {
+      const saved = await persistSubscriptionsAfterSubSave();
+      if (saved?.subscriptions) editingSubs = saved.subscriptions.map(normalizeSubForEditor);
+      toast(editingSubIndex === -1 ? 'Subscription added' : 'Subscription saved');
+    } else {
+      toast(editingSubIndex === -1 ? 'Subscription added — save webhook to create' : 'Subscription updated');
+    }
+    editingSubIndex = null;
+    renderSubList();
+    showPage('edit');
+  } catch (err) { toast(err.message, true); }
+};
 $('#closeEventModal').onclick = () => $('#eventModal').classList.add('hidden');
 $('#webhookForm').onsubmit = async e => {
   e.preventDefault();
-  const body = { name: $('#webhookName').value.trim(), status: $('#webhookStatus').value, actions: collect($('#actionRows'), 'action'), subscriptions: collect($('#subRows'), 'sub') };
+  const body = { name: $('#webhookName').value.trim(), status: $('#webhookStatus').value, actions: collectActions(), subscriptions: editingSubs.filter(s => s.target_url).map(subToApi) };
   try {
     if (editingId) {
       const d = await api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(body) });

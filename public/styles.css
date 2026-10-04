@@ -21,3 +21,10 @@
 .preview-ok{color:var(--accent2);font-weight:700;margin-bottom:6px}.preview-err{color:var(--danger);margin-bottom:6px}
 .preview-grid{display:grid;gap:6px;margin:6px 0}.preview-grid span{font-size:10px;letter-spacing:.1em;color:#65707b;font-weight:800;display:block}
 .preview-grid code,.preview-box code{word-break:break-all}
+.sub-list-row{margin:8px 0}
+.sub-list-row small{display:block;color:var(--muted);margin-top:3px}
+.sub-list-row small.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#bec7d1;word-break:break-all}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#page-subedit input,#page-subedit select,#page-subedit textarea{width:100%;border:1px solid var(--line);background:#0c1014;color:var(--text);border-radius:10px;padding:9px 10px;outline:none;font-size:13px}
+#page-subedit textarea.code,#subTargetUrl{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+#subList .empty{border:1px dashed var(--line);border-radius:12px;padding:14px;color:var(--muted);font-size:13px}

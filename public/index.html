@@ -61,9 +61,34 @@
         <div class="subhead"><span>Actions <small class="muted">JS scripts, run in order</small></span><button type="button" class="ghost sm" id="addActionBtn">+ Add action</button></div>
         <div id="actionRows"></div>
         <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
-        <div id="subRows"></div>
+        <div id="subList"></div>
         <div class="callout"><b>Pipeline:</b> event is persisted, pre-actions run, payload is forwarded to each enabled subscription, then post-actions run. Deliveries are logged per event.</div>
         <div class="modal-actions"><button type="button" class="ghost" id="cancelEdit">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
+      </form></div>
+    </section>
+    <section id="page-subedit" class="page hidden">
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow" id="subEditEyebrow">SUBSCRIPTION</div><h3 id="subEditTitle">Edit subscription</h3><p id="subEditSub">Edit one subscription. Nothing else changes until you save.</p></div><button class="ghost" id="backToEdit">← Back</button></div>
+      <form id="subEditForm">
+        <div class="field"><label>Name</label><input id="subName" placeholder="Subscription name" maxlength="100"/></div>
+        <div class="row-grid three">
+          <div class="field" style="margin:0"><label>Method</label><select id="subMethod"><option value="POST">POST</option><option value="PUT">PUT</option><option value="PATCH">PATCH</option><option value="DELETE">DELETE</option></select></div>
+          <div class="field" style="margin:0"><label>Status</label><select id="subEnabled"><option value="1">enabled</option><option value="0">disabled</option></select></div>
+          <div class="field" style="margin:0"><label>Body mode</label><select id="subPayloadMode"><option value="passthrough">passthrough</option><option value="custom">custom JSON</option></select></div>
+        </div>
+        <div class="field"><label>Target URL <small class="muted">supports {{ }} variables</small></label><input id="subTargetUrl" placeholder="https://example.com/hooks/{{ body.tenant_id }}" inputmode="url" class="tpl-field mono"/></div>
+        <div class="hint">URL supports <code>{{ }}</code> variables — e.g. <code>{{ body.user.id }}</code>, <code>{{ query.token }}</code>, <code>{{ headers.x-tenant }}</code></div>
+        <div class="field"><label>Signing secret <small class="muted" id="subSecretHint">optional</small></label><input id="subSecret" type="password" placeholder="Leave blank to keep existing" autocomplete="off"/></div>
+        <div class="hdr-head"><span>Custom headers <small class="muted">values support {{ }} too</small></span><button type="button" class="ghost sm" id="subAddHdr">+ Header</button></div>
+        <div id="subHeadersBox"></div>
+        <div id="subPayloadWrap"><div class="field"><label>Custom JSON body</label><textarea id="subPayloadTemplate" class="tpl-field code" placeholder='{
+  "userId": "{{ body.user.id }}",
+  "plan": "{{ body.plan || &quot;free&quot; }}"
+}'></textarea></div>
+        <div class="hint">Custom JSON body with variables. Choose <b>passthrough</b> to forward the event body unchanged.</div></div>
+        <div class="sub-tools"><button type="button" class="ghost sm" id="subVarsBtn">Variables</button><button type="button" class="ghost sm" id="subPreviewBtn">Preview render</button></div>
+        <div class="var-panel hidden" id="subVarPanel"></div>
+        <div class="preview-box hidden" id="subPreviewBox"></div>
+        <div class="modal-actions"><button type="button" class="ghost" id="cancelSubEdit">Cancel</button><button class="primary" type="submit" id="subSaveBtn">Save subscription</button></div>
       </form></div>
     </section>
   </main>
