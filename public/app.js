@@ -1,6 +1,6 @@
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
-let authMode = 'login', currentPage = 'dashboard', currentWebhook = null, user = null;
+let currentPage = 'dashboard', currentWebhook = null, user = null;
 let editingId = null;
 let editingPre = null;
 let editingSubs = [];
@@ -67,23 +67,14 @@ async function bootstrap() {
       setTimeout(() => toast(ssoError, true), 50);
     }
   } catch {}
-  try { const cfg = await api('/api/auth/config'); const w = $('#ssoWrap'); if (w && cfg.googleEnabled) w.classList.remove('hidden'); } catch {}
+  try {
+    const cfg = await api('/api/auth/config');
+    const btn = $('#googleBtn'), note = $('#ssoDisabled');
+    if (cfg.googleEnabled) btn?.classList.remove('hidden');
+    else { btn?.classList.add('hidden'); note?.classList.remove('hidden'); }
+  } catch {}
   try { const d = await api('/api/me'); user = d.user; showApp(); } catch { showAuth(); }
 }
-$$('.tab').forEach(b => b.onclick = () => {
-  authMode = b.dataset.auth;
-  $$('.tab').forEach(x => x.classList.toggle('active', x === b));
-  $('#nameWrap').classList.toggle('hidden', authMode !== 'signup');
-  $('#password').autocomplete = authMode === 'signup' ? 'new-password' : 'current-password';
-  $('#authSubmit').textContent = authMode === 'signup' ? 'Create account' : 'Login';
-});
-$('#authForm').onsubmit = async e => {
-  e.preventDefault();
-  try {
-    const d = await api('/api/auth/' + authMode, { method: 'POST', body: JSON.stringify({ name: $('#name').value, email: $('#email').value, password: $('#password').value }) });
-    user = d.user; showApp(); toast(authMode === 'signup' ? 'Account created' : 'Welcome back');
-  } catch (err) { toast(err.message, true); }
-};
 $('#logoutBtn').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); user = null; showAuth(); };
 $$('[data-page]').forEach(b => b.onclick = () => showPage(b.dataset.page));
 

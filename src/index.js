@@ -495,31 +495,10 @@ export default {
         return new Response(null, { status: 302, headers: hdrs });
       }
 
-      if (request.method === "POST" && p === "/api/auth/signup") {
-        const b = await readJson(request);
-        const email = String(b.email || "").trim().toLowerCase();
-        const name = String(b.name || "").trim();
-        const password = String(b.password || "");
-        if (!email || !email.includes("@") || !name || password.length < 8) return json({ error: "Name, valid email and password (8+ chars) are required" }, 400);
-        const existing = await env.DB.prepare("SELECT id FROM users WHERE email=?").bind(email).first();
-        if (existing) return json({ error: "Account already exists" }, 409);
-        const { salt, hash } = await hashPassword(password);
-        const created = now();
-        const result = await env.DB.prepare("INSERT INTO users (email,name,password_hash,password_salt,created_at) VALUES (?,?,?,?,?)")
-          .bind(email, name, hash, salt, created).run();
-        const user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
-        return json({ user: sanitizeUser(user) }, 201, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) });
-      }
-
-      if (request.method === "POST" && p === "/api/auth/login") {
-        const b = await readJson(request);
-        const email = String(b.email || "").trim().toLowerCase();
-        const password = String(b.password || "");
-        const user = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
-        if (!user) return json({ error: "Invalid email or password" }, 401);
-        if (user.password_hash === "OAUTH" || user.password_salt === "OAUTH") return json({ error: "This account uses Google sign-in. Please continue with Google." }, 401);
-        if (!(await verifyPassword(password, user.password_salt, user.password_hash))) return json({ error: "Invalid email or password" }, 401);
-        return json({ user: sanitizeUser(user) }, 200, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) });
+      // Password auth removed — Google SSO only. Existing password users
+      // re-enter via Google (same email auto-links to their account).
+      if (request.method === "POST" && (p === "/api/auth/signup" || p === "/api/auth/login")) {
+        return json({ error: "Password sign-in is disabled. Please continue with Google." }, 403);
       }
 
       if (request.method === "POST" && p === "/api/auth/logout") return json({ ok: true }, 200, { "set-cookie": clearSessionCookie() });
