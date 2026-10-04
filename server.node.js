@@ -12,6 +12,21 @@ const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 60);
 const RATE_LIMIT_BURST = Number(process.env.RATE_LIMIT_BURST || 20);
 const WEBHOOK_BODY_LIMIT = 256 * 1024;
+// Idle session timeout in ms. Configurable via SESSION_TTL_MINUTES
+// (preferred) or SESSION_TTL_MS. Defaults to 10 minutes of inactivity.
+const SESSION_TTL_MS = (() => {
+  const minutesRaw = process.env.SESSION_TTL_MINUTES;
+  if (minutesRaw !== undefined && String(minutesRaw).trim() !== "") {
+    const minutes = Number(minutesRaw);
+    if (Number.isFinite(minutes) && minutes > 0) return Math.floor(minutes * 60 * 1000);
+  }
+  const msRaw = process.env.SESSION_TTL_MS;
+  if (msRaw !== undefined && String(msRaw).trim() !== "") {
+    const ms = Number(msRaw);
+    if (Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+  }
+  return 10 * 60 * 1000;
+})();
 
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const db = new DatabaseSync(DB_FILE);
@@ -142,9 +157,12 @@ function verifyPassword(password, salt, expected) {
   return crypto.timingSafeEqual(Buffer.from(actual,'hex'), Buffer.from(expected,'hex'));
 }
 function signSession(userId) {
-  const body = Buffer.from(JSON.stringify({uid:userId, exp:Date.now()+7*24*3600*1000})).toString('base64url');
+  const body = Buffer.from(JSON.stringify({uid:userId, exp:Date.now()+SESSION_TTL_MS})).toString('base64url');
   const sig = crypto.createHmac('sha256', APP_SECRET).update(body).digest('base64url');
   return `${body}.${sig}`;
+}
+function sessionCookie(value) {
+  return `sid=${value}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS/1000)}`;
 }
 function readSession(req) {
   const cookie = req.headers.cookie || '';
@@ -180,6 +198,8 @@ async function readJson(req) {
 function auth(req,res) {
   const user=readSession(req);
   if (!user) { json(res,401,{error:'Authentication required'}); return null; }
+  // Sliding inactivity expiry: refresh the cookie on every authenticated call.
+  res.setHeader('Set-Cookie', sessionCookie(signSession(user.id)));
   return user;
 }
 
@@ -276,7 +296,7 @@ async function router(req,res) {
       if (!email || !email.includes('@') || !name || pw.length<8) return json(res,400,{error:'Name, valid email and password (8+ chars) are required'});
       if (statements.userByEmail.get(email)) return json(res,409,{error:'Account already exists'});
       const {hash,salt}=hashPassword(pw); const created=now(); const r=statements.insertUser.run(email,name,hash,salt,created); const user=statements.userById.get(r.lastInsertRowid);
-      res.setHeader('Set-Cookie',`sid=${signSession(user.id)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`);
+      res.setHeader('Set-Cookie',sessionCookie(signSession(user.id)));
       return json(res,201,{user:sanitizeUser(user)});
     } catch(e){ return json(res,e.status||500,{error:e.message}); }
   }
@@ -284,7 +304,7 @@ async function router(req,res) {
     try {
       const b=await readJson(req); const email=String(b.email||'').trim().toLowerCase(); const pw=String(b.password||''); const u=statements.userByEmail.get(email);
       if (!u || !verifyPassword(pw,u.password_salt,u.password_hash)) return json(res,401,{error:'Invalid email or password'});
-      res.setHeader('Set-Cookie',`sid=${signSession(u.id)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`);
+      res.setHeader('Set-Cookie',sessionCookie(signSession(u.id)));
       return json(res,200,{user:sanitizeUser(u)});
     } catch(e){ return json(res,500,{error:e.message}); }
   }

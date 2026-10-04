@@ -55,7 +55,7 @@ Create an account in the dashboard, create a webhook, then:
 ```bash
 curl -X POST "https://YOUR-WORKER.workers.dev/webhooks/YOUR_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"event":"user.created","userId":123,"name":"Aniket"}'
+  -d '{"event":"user.created","userId":123,"name":"Jane"}'
 ```
 
 Expected response:

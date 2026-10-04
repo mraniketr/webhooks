@@ -1,7 +1,23 @@
 const WEBHOOK_BODY_LIMIT = 256 * 1024;
 const RATE_LIMIT = 60;
 const RATE_PERIOD = 60;
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
+
+// Idle session timeout, configurable via env. Supports SESSION_TTL_MINUTES
+// (preferred) or SESSION_TTL_MS. Defaults to 10 minutes of inactivity.
+function sessionTtlMs(env) {
+  const minutesRaw = env?.SESSION_TTL_MINUTES;
+  if (minutesRaw !== undefined && minutesRaw !== null && String(minutesRaw).trim() !== "") {
+    const minutes = Number(minutesRaw);
+    if (Number.isFinite(minutes) && minutes > 0) return Math.floor(minutes * 60 * 1000);
+  }
+  const msRaw = env?.SESSION_TTL_MS;
+  if (msRaw !== undefined && msRaw !== null && String(msRaw).trim() !== "") {
+    const ms = Number(msRaw);
+    if (Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+  }
+  return DEFAULT_SESSION_TTL_MS;
+}
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -72,8 +88,8 @@ async function verifyPassword(password, salt, expected) {
   return actual === expected;
 }
 
-async function signSession(userId, secret) {
-  const body = base64urlFromBytes(new TextEncoder().encode(JSON.stringify({ uid: userId, exp: Date.now() + SESSION_TTL_MS })));
+async function signSession(userId, secret, ttlMs) {
+  const body = base64urlFromBytes(new TextEncoder().encode(JSON.stringify({ uid: userId, exp: Date.now() + ttlMs })));
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = base64urlFromBytes(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
   return `${body}.${sig}`;
@@ -98,11 +114,20 @@ function getCookie(request, name) {
   return part ? decodeURIComponent(part.slice(name.length + 1)) : null;
 }
 
-function sessionCookie(value) {
-  return `sid=${encodeURIComponent(value)}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`;
+function sessionCookie(value, ttlMs) {
+  return `sid=${encodeURIComponent(value)}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${Math.floor(ttlMs / 1000)}`;
 }
 function clearSessionCookie() {
   return "sid=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0";
+}
+
+// Sliding inactivity expiry: every authenticated API response re-issues the
+// session cookie with a fresh expiry, so 10 idle minutes logs the user out.
+async function refreshedSessionHeaders(user, env, ttlMs) {
+  return { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) };
+}
+async function apiJson(user, env, ttlMs, body, status = 200) {
+  return json(body, status, await refreshedSessionHeaders(user, env, ttlMs));
 }
 
 function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at }; }
@@ -240,6 +265,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const p = url.pathname;
+    const ttlMs = sessionTtlMs(env);
 
     if (p === "/" && request.method === "GET") return env.ASSETS.fetch(request);
     if (p.endsWith(".js") || p.endsWith(".css") || p.endsWith(".html")) return env.ASSETS.fetch(request);
@@ -258,7 +284,7 @@ export default {
         const result = await env.DB.prepare("INSERT INTO users (email,name,password_hash,password_salt,created_at) VALUES (?,?,?,?,?)")
           .bind(email, name, hash, salt, created).run();
         const user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
-        return json({ user: sanitizeUser(user) }, 201, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET)) });
+        return json({ user: sanitizeUser(user) }, 201, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) });
       }
 
       if (request.method === "POST" && p === "/api/auth/login") {
@@ -267,7 +293,7 @@ export default {
         const password = String(b.password || "");
         const user = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
         if (!user || !(await verifyPassword(password, user.password_salt, user.password_hash))) return json({ error: "Invalid email or password" }, 401);
-        return json({ user: sanitizeUser(user) }, 200, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET)) });
+        return json({ user: sanitizeUser(user) }, 200, { "set-cookie": sessionCookie(await signSession(user.id, env.APP_SECRET, ttlMs), ttlMs) });
       }
 
       if (request.method === "POST" && p === "/api/auth/logout") return json({ ok: true }, 200, { "set-cookie": clearSessionCookie() });
@@ -277,7 +303,7 @@ export default {
         if (!user) return json({ error: "Authentication required" }, 401);
 
         if (request.method === "GET" && p === "/api/me") {
-          return json({ user: sanitizeUser(user), rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+          return apiJson(user, env, ttlMs, { user: sanitizeUser(user), rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
         }
 
         if (request.method === "GET" && p === "/api/dashboard") {
@@ -292,7 +318,7 @@ export default {
             FROM webhooks w LEFT JOIN events e ON e.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
           const recent = await env.DB.prepare(`SELECT e.id,e.method,e.status,e.received_at,w.name webhook_name
             FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE w.user_id=? ORDER BY e.id DESC LIMIT 8`).bind(user.id).all();
-          return json({ stats: { total: Number(stats.total || 0), processed: Number(stats.processed || 0), failed: Number(stats.failed || 0), pending: Number(stats.pending || 0) },
+          return apiJson(user, env, ttlMs, { stats: { total: Number(stats.total || 0), processed: Number(stats.processed || 0), failed: Number(stats.failed || 0), pending: Number(stats.pending || 0) },
             webhooks: hooks.results.map(w => webhookView(w, request)), recent: recent.results });
         }
 
@@ -301,7 +327,7 @@ export default {
             SUM(CASE WHEN e.status='processed' THEN 1 ELSE 0 END) processed,
             SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) failed
             FROM webhooks w LEFT JOIN events e ON e.webhook_id=w.id WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
-          return json({ webhooks: rows.results.map(w => webhookView(w, request)) });
+          return apiJson(user, env, ttlMs, { webhooks: rows.results.map(w => webhookView(w, request)) });
         }
 
         if (request.method === "POST" && p === "/api/webhooks") {
@@ -318,22 +344,22 @@ export default {
           await saveSubscriptions(env, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
-          return json({ webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions }, 201);
+          return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions }, 201);
         }
 
         const hookIdMatch = p.match(/^\/api\/webhooks\/(\d+)$/);
         if ((request.method === "PUT" || request.method === "PATCH") && hookIdMatch) {
           const wid = Number(hookIdMatch[1]);
           const existing = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
-          if (!existing) return json({ error: "Not found" }, 404);
+          if (!existing) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const b = await readJson(request);
           if (b.name !== undefined) {
             const name = String(b.name || "").trim();
-            if (!name) return json({ error: "Name is required" }, 400);
+            if (!name) return apiJson(user, env, ttlMs, { error: "Name is required" }, 400);
             await env.DB.prepare("UPDATE webhooks SET name=? WHERE id=?").bind(name.slice(0, 200), wid).run();
           }
           if (b.status !== undefined) {
-            if (!["active", "disabled"].includes(b.status)) return json({ error: "Status must be active or disabled" }, 400);
+            if (!["active", "disabled"].includes(b.status)) return apiJson(user, env, ttlMs, { error: "Status must be active or disabled" }, 400);
             await env.DB.prepare("UPDATE webhooks SET status=? WHERE id=?").bind(b.status, wid).run();
           }
           const actions = normalizeActions(b.actions);
@@ -342,45 +368,45 @@ export default {
           if (subs) await mergeSubscriptions(env, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
-          return json({ webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
+          return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
         }
         if (request.method === "GET" && hookIdMatch) {
           const wid = Number(hookIdMatch[1]);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
-          if (!w) return json({ error: "Not found" }, 404);
+          if (!w) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const stats = await env.DB.prepare(`SELECT COUNT(*) total,
             SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) processed,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
             SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) pending
             FROM events WHERE webhook_id=?`).bind(wid).first();
           const rel = await webhookRelations(env, wid);
-          return json({ webhook: webhookView(w, request), stats, actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+          return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), stats, actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
         }
 
         const eventsMatch = p.match(/^\/api\/webhooks\/(\d+)\/events$/);
         if (request.method === "GET" && eventsMatch) {
           const wid = Number(eventsMatch[1]);
           const owns = await env.DB.prepare("SELECT id FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
-          if (!owns) return json({ error: "Not found" }, 404);
+          if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 25)));
           const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
           const rows = await env.DB.prepare(`SELECT e.id,e.method,e.ip,e.status,e.error,e.received_at,e.processed_at,
             substr(COALESCE(e.payload_json,e.raw_body,''),1,140) payload_preview
             FROM events e WHERE e.webhook_id=? ORDER BY e.id DESC LIMIT ? OFFSET ?`).bind(wid, limit, offset).all();
           const total = await env.DB.prepare("SELECT COUNT(*) count FROM events WHERE webhook_id=?").bind(wid).first();
-          return json({ events: rows.results, total: Number(total.count || 0) });
+          return apiJson(user, env, ttlMs, { events: rows.results, total: Number(total.count || 0) });
         }
 
         const eventMatch = p.match(/^\/api\/events\/(\d+)$/);
         if (request.method === "GET" && eventMatch) {
           const event = await env.DB.prepare(`SELECT e.*,w.name webhook_name,w.token
             FROM events e JOIN webhooks w ON w.id=e.webhook_id WHERE e.id=? AND w.user_id=?`).bind(Number(eventMatch[1]), user.id).first();
-          if (!event) return json({ error: "Not found" }, 404);
+          if (!event) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const deliveries = await env.DB.prepare(`SELECT d.id,d.subscription_id,d.target_url,d.status,d.attempts,d.http_status,
             d.response_preview,d.error,d.created_at,d.completed_at,s.name subscription_name
             FROM deliveries d LEFT JOIN subscriptions s ON s.id=d.subscription_id
             WHERE d.event_id=? ORDER BY d.id`).bind(event.id).all();
-          return json({ event: { ...event, headers: JSON.parse(event.headers_json || "{}"), payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
+          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
         }
       }
 

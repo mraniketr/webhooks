@@ -27,5 +27,8 @@
       "simple": { "limit": 60, "period": 60 }
     }
   ],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "vars": {
+    "SESSION_TTL_MINUTES": "10"
+  }
 }
