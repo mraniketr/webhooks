@@ -78,39 +78,6 @@ function bytesFromBase64url(s) {
   return out;
 }
 
-async function sha256(value) {
-  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return base64urlFromBytes(bytes);
-}
-
-async function derivePassword(password, saltB64) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: bytesFromBase64url(saltB64), iterations: 100000, hash: "SHA-256" },
-    key,
-    256
-  );
-  return base64urlFromBytes(bits);
-}
-
-async function hashPassword(password) {
-  const salt = new Uint8Array(16);
-  crypto.getRandomValues(salt);
-  const saltB64 = base64urlFromBytes(salt);
-  return { salt: saltB64, hash: await derivePassword(password, saltB64) };
-}
-
-async function verifyPassword(password, salt, expected) {
-  const actual = await derivePassword(password, salt);
-  return actual === expected;
-}
-
 async function signSession(userId, secret, ttlMs) {
   const body = base64urlFromBytes(new TextEncoder().encode(JSON.stringify({ uid: userId, exp: Date.now() + ttlMs })));
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -554,23 +521,15 @@ export default {
             try {
               await env.DB.prepare("UPDATE users SET google_sub=? WHERE id=?").bind(sub, byEmail.id).run();
             } catch {
-              return fail("This email is already registered. Please log in with your password first.");
+              return fail("This email is already registered with a different Google account.");
             }
             user = byEmail;
           } else {
             const created = now();
-            try {
-              const result = await env.DB.prepare(
-                "INSERT INTO users (email,name,password_hash,password_salt,created_at,google_sub) VALUES (?,?,?,?,?,?)"
-              ).bind(email, name, "OAUTH", "OAUTH", created, sub).run();
-              user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
-            } catch {
-              // Column may not exist on old DBs — fall back to placeholder insert.
-              const result = await env.DB.prepare(
-                "INSERT INTO users (email,name,password_hash,password_salt,created_at) VALUES (?,?,?,?,?)"
-              ).bind(email, name, "OAUTH", "OAUTH", created).run();
-              user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
-            }
+            const result = await env.DB.prepare(
+              "INSERT INTO users (email,name,created_at,google_sub) VALUES (?,?,?,?)"
+            ).bind(email, name, created, sub).run();
+            user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
           }
         }
         if (!user) return fail("Could not create account.");
