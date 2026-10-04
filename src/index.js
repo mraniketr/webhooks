@@ -1,4 +1,5 @@
 import { buildContext, evaluatePreAssignment, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
+import { getWebhookByToken, invalidateAllSubscriptions, invalidateRouteConfig, invalidateSubscription, invalidateWebhook } from "./cache.js";
 
 // Queue messages cap at 128 KiB — keep inbound bodies well under that so the
 // full event (payload + headers + query + envelope) fits in one message.
@@ -210,13 +211,14 @@ function normalizeSubscriptions(input) {
   return out;
 }
 
-async function saveActions(env, wid, actions) {
+async function saveActions(env, ctx, wid, actions) {
   await env.DB.prepare("DELETE FROM actions WHERE webhook_id=?").bind(wid).run();
   for (let i = 0; i < actions.length; i++) {
     const a = actions[i];
     await env.DB.prepare("INSERT INTO actions (webhook_id,phase,name,code,sort_order,enabled) VALUES (?,?,?,?,?,?)")
       .bind(wid, a.phase, a.name, a.code, i, a.enabled).run();
   }
+  invalidateRouteConfig(env, ctx, wid);
 }
 
 async function ensureSubscriptionColumns(env) {
@@ -257,7 +259,7 @@ async function ensureSubscriptionCounterTables(env) {
   } catch { /* ignore — readers fall back to zeros */ }
 }
 
-async function saveSubscriptions(env, wid, subs) {
+async function saveSubscriptions(env, ctx, wid, subs) {
   await ensureSubscriptionColumns(env);
   await ensureSubscriptionCounterTables(env);
   // Remove counters for subscriptions about to be replaced (FK cascade may
@@ -286,6 +288,7 @@ async function saveSubscriptions(env, wid, subs) {
       } catch { /* ignore */ }
     }
   }
+  invalidateAllSubscriptions(env, ctx, wid);
 }
 
 function subscriptionView(s) {
@@ -332,7 +335,7 @@ async function webhookRelations(env, wid) {
   return { actions: actions.results, subscriptions: (subscriptions.results || []).map(subscriptionView) };
 }
 
-async function mergeSubscriptions(env, wid, input) {
+async function mergeSubscriptions(env, ctx, wid, input) {
   // Update in place when an id matches (preserves the signing secret when
   // the client leaves it blank); insert new rows; delete removed rows.
   // Per-subscription counters are preserved on update, seeded on insert,
@@ -386,8 +389,10 @@ async function mergeSubscriptions(env, wid, input) {
         await env.DB.prepare("DELETE FROM subscription_counters WHERE subscription_id=?").bind(s.id).run();
         await env.DB.prepare("DELETE FROM subscription_daily_counters WHERE subscription_id=?").bind(s.id).run();
       } catch { /* ignore */ }
+      invalidateSubscription(env, ctx, s.id);
     }
   }
+  invalidateAllSubscriptions(env, ctx, wid);
 }
 
 async function sampleContextForWebhook(env, wid) {
@@ -605,9 +610,9 @@ export default {
             .bind(user.id, name, token, created).run();
           const wid = hook.meta.last_row_id;
           const actions = normalizeActions(b.actions) || [];
-          await saveActions(env, wid, actions);
+          await saveActions(env, ctx, wid, actions);
           const subs = normalizeSubscriptions(b.subscriptions) || [];
-          await saveSubscriptions(env, wid, subs);
+          await saveSubscriptions(env, ctx, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
           return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions }, 201);
@@ -623,15 +628,17 @@ export default {
             const name = String(b.name || "").trim();
             if (!name) return apiJson(user, env, ttlMs, { error: "Name is required" }, 400);
             await env.DB.prepare("UPDATE webhooks SET name=? WHERE id=?").bind(name.slice(0, 200), wid).run();
+            invalidateWebhook(env, ctx, { id: wid, token: existing.token });
           }
           if (b.status !== undefined) {
             if (!["active", "disabled"].includes(b.status)) return apiJson(user, env, ttlMs, { error: "Status must be active or disabled" }, 400);
             await env.DB.prepare("UPDATE webhooks SET status=? WHERE id=?").bind(b.status, wid).run();
+            invalidateWebhook(env, ctx, { id: wid, token: existing.token });
           }
           const actions = normalizeActions(b.actions);
-          if (actions) await saveActions(env, wid, actions);
+          if (actions) await saveActions(env, ctx, wid, actions);
           const subs = normalizeSubscriptions(b.subscriptions);
-          if (subs) await mergeSubscriptions(env, wid, subs);
+          if (subs) await mergeSubscriptions(env, ctx, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
           return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
@@ -710,11 +717,29 @@ export default {
       const publicMatch = p.match(/^\/webhooks\/([^/]+)$/);
       if (publicMatch && ["POST", "PUT", "PATCH"].includes(request.method)) {
         const token = publicMatch[1];
-        const hook = await env.DB.prepare("SELECT * FROM webhooks WHERE token=? AND status='active'").bind(token).first();
-        if (!hook) return json({ error: "Webhook not found" }, 404);
+        // Hot path: webhook lookup is cached (memory + optional KV) so
+        // repeat traffic skips D1. Body read runs concurrently with the
+        // lookup so neither blocks the other — whichever is slower sets the
+        // latency, not the sum.
+        const hookPromise = getWebhookByToken(env, ctx, token, async () =>
+          env.DB.prepare("SELECT id, user_id, name, token, status FROM webhooks WHERE token=?")
+            .bind(token).first().catch(() => null)
+        );
+        const rawPromise = readBody(request);
+        let hook;
+        let raw;
+        try {
+          [hook, raw] = await Promise.all([hookPromise, rawPromise]);
+        } catch (error) {
+          // readBody throws 413 on oversize; make sure the cached lookup
+          // still resolves (and reuses single-flight) before responding.
+          if (error?.status === 413) throw error;
+          hook = await hookPromise;
+          raw = await rawPromise;
+        }
+        if (!hook || hook.status !== "active") return json({ error: "Webhook not found" }, 404);
         const rl = await rateLimit(request, env, hook.user_id);
         if (!rl.success) return json({ error: "Rate limit exceeded" }, 429, { "retry-after": "60" });
-        const raw = await readBody(request);
         const payload = parsePayload(request, raw);
         const received = now();
         // No D1 write on ingest — the event travels in the queue message.

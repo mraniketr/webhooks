@@ -1,4 +1,5 @@
 import { buildContext, evaluatePreAssignment, renderSubscription } from "./template.js";
+import { getRouteConfig, getSubscription, getWebhookRow, invalidateRouteConfig } from "./cache.js";
 
 function now() {
   return new Date().toISOString();
@@ -71,21 +72,56 @@ async function runUserScript(code, msg, webhookRow) {
 // fan out one delivery task per enabled subscription carrying the full
 // event + pre in the message, ack. No per-event D1 writes here — status is
 // emitted as a structured log, counts go to the analytics queue.
+//
+// Hot-path reads (webhook row + pre-action + subscription ids) are cached
+// as one route-config entry, so steady traffic skips D1 entirely. The three
+// D1 queries run concurrently on a miss, and fan-out sends run concurrently
+// so per-subscription latency never stacks.
 async function processEvent(message, env, ctx) {
   const msg = message || {};
   const eventId = msg.eventId != null ? String(msg.eventId) : "";
   const webhookId = Number(msg.webhookId);
   if (!eventId || !webhookId) return;
 
-  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?")
-    .bind(webhookId).first().catch(() => null);
-  const actions = await env.DB.prepare(
-    "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
-  ).bind(webhookId).all().catch(() => ({ results: [] }));
+  let route = await getRouteConfig(env, ctx, webhookId, async () => {
+    const [webhookRow, actions, subs] = await Promise.all([
+      env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null),
+      env.DB.prepare(
+        "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
+      ).bind(webhookId).all().catch(() => ({ results: [] })),
+      env.DB.prepare(
+        "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
+      ).bind(webhookId).all().catch(() => ({ results: [] })),
+    ]);
+    return {
+      webhookRow: webhookRow || null,
+      actions: actions?.results || [],
+      subIds: (subs?.results || []).map((s) => Number(s.id)).filter(Boolean),
+    };
+  }).catch(() => null);
+
+  // Stale-empty guard: a cached "no subscriptions" entry must never drop a
+  // fan-out right after a subscription was added. Re-check D1 once and
+  // refresh the cache when the fresh list is non-empty.
+  if (route && (route.subIds || []).length === 0) {
+    try {
+      const fresh = await env.DB.prepare(
+        "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
+      ).bind(webhookId).all().catch(() => null);
+      const freshIds = (fresh?.results || []).map((s) => Number(s.id)).filter(Boolean);
+      if (freshIds.length > 0) {
+        invalidateRouteConfig(env, ctx, webhookId);
+        route = { ...route, subIds: freshIds };
+      }
+    } catch { /* keep cached route */ }
+  }
+
+  const webhookRow = route?.webhookRow || null;
+  const cachedActions = route?.actions || [];
 
   let pre = {};
   let preError = null;
-  const enabled = (actions.results || []).filter((x) => x.phase === "pre" || !x.phase);
+  const enabled = (cachedActions || []).filter((x) => x.phase === "pre" || !x.phase);
   const action = enabled[0];
   if (action && action.code && String(action.code).trim()) {
     const r = await runUserScript(action.code, msg, webhookRow);
@@ -93,27 +129,39 @@ async function processEvent(message, env, ctx) {
     preError = r.error;
   }
 
-  const subs = await env.DB.prepare(
-    "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
-  ).bind(webhookId).all().catch(() => ({ results: [] }));
-  const targets = subs.results || [];
+  const targets = route?.subIds || [];
 
-  for (const sub of targets) {
-    await env.DELIVERY_QUEUE.send({
-      eventId,
-      webhookId,
-      subscriptionId: sub.id,
-      method: msg.method || "POST",
-      headers: msg.headers || {},
-      query: msg.query || {},
-      payload: msg.payload ?? null,
-      rawBody: msg.rawBody ?? null,
-      ip: msg.ip || "",
-      receivedAt: msg.receivedAt || now(),
-      pre,
-    });
+  // Fan-out concurrently: per-subscription latency never stacks, and the
+  // analytics increment rides along with its own delivery send.
+  const baseDelivery = {
+    eventId,
+    webhookId,
+    method: msg.method || "POST",
+    headers: msg.headers || {},
+    query: msg.query || {},
+    payload: msg.payload ?? null,
+    rawBody: msg.rawBody ?? null,
+    ip: msg.ip || "",
+    receivedAt: msg.receivedAt || now(),
+    pre,
+  };
+  const sendOne = async (subscriptionId) => {
+    await env.DELIVERY_QUEUE.send({ ...baseDelivery, subscriptionId });
     // Subscription-level stat: one task enqueued for this subscription.
-    await emitAnalytics(env, analyticsMsg(webhookId, "enqueued", 1, msg.receivedAt, sub.id));
+    await emitAnalytics(env, analyticsMsg(webhookId, "enqueued", 1, msg.receivedAt, subscriptionId));
+  };
+  if (typeof env.DELIVERY_QUEUE.sendBatch === "function") {
+    // One round-trip for N deliveries when the runtime supports batching.
+    try {
+      await env.DELIVERY_QUEUE.sendBatch(targets.map((subscriptionId) => ({ body: { ...baseDelivery, subscriptionId } })));
+      await Promise.all(targets.map((subscriptionId) =>
+        emitAnalytics(env, analyticsMsg(webhookId, "enqueued", 1, msg.receivedAt, subscriptionId))
+      ));
+    } catch {
+      await Promise.all(targets.map(sendOne));
+    }
+  } else {
+    await Promise.all(targets.map(sendOne));
   }
 
   logEventStatus({
@@ -137,7 +185,24 @@ async function processDelivery(message, env, ctx) {
   const subscriptionId = Number(msg.subscriptionId);
   if (!eventId || !webhookId || !subscriptionId) return;
 
-  const sub = await env.DB.prepare("SELECT * FROM subscriptions WHERE id=?").bind(subscriptionId).first();
+  // Both reads are cached and run concurrently — steady traffic skips D1.
+  let [sub, webhookRow] = await Promise.all([
+    getSubscription(env, ctx, subscriptionId, async () =>
+      env.DB.prepare("SELECT * FROM subscriptions WHERE id=?").bind(subscriptionId).first().catch(() => null)
+    ).catch(() => null),
+    getWebhookRow(env, ctx, webhookId, async () =>
+      env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null)
+    ).catch(() => null),
+  ]);
+  // Stale-disabled guard: a cached disabled/missing row must never drop a
+  // delivery right after a re-enable. Re-check D1 once before skipping.
+  if (!sub || !sub.enabled) {
+    try {
+      const fresh = await env.DB.prepare("SELECT * FROM subscriptions WHERE id=?")
+        .bind(subscriptionId).first().catch(() => null);
+      if (fresh && fresh.enabled) sub = fresh;
+    } catch { /* keep cached value */ }
+  }
   if (!sub || !sub.enabled) {
     logEventStatus({
       msg: "delivery skipped", status: "skipped",
@@ -146,8 +211,6 @@ async function processDelivery(message, env, ctx) {
     return;
   }
 
-  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?")
-    .bind(webhookId).first().catch(() => null);
   const tplCtx = buildContext(
     rowFromMessage(msg, msg.pre || {}),
     webhookRow,
