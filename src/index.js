@@ -140,39 +140,25 @@ async function auth(request, env) {
 }
 
 async function rateLimit(request, env, userId) {
-  const result = await env.USER_RATE_LIMITER.limit({ key: String(userId) });
-  return result;
+  // Rate-limit binding may be unavailable on some plans — fail open.
+  try {
+    if (!env.USER_RATE_LIMITER) return { success: true };
+    return await env.USER_RATE_LIMITER.limit({ key: String(userId) });
+  } catch {
+    return { success: true };
+  }
 }
 
 async function runUserScript(code, event, env, ctx) {
-  const moduleSource = `
-    export default {
-      async fetch(request) {
-        const event = await request.json();
-        const logs = [];
-        const log = (...args) => logs.push(args.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
-        const setStatus = (status) => { event.statusOverride = String(status); };
-        ${code}\n
-        return Response.json({ event, logs });
-      }
-    };
-  `;
-  const worker = env.LOADER.load({
-    compatibilityDate: "2026-10-02",
-    mainModule: "action.js",
-    modules: { "action.js": moduleSource },
-    globalOutbound: null,
-    limits: { cpuMs: 50 },
-  });
-  const request = new Request("https://sandbox.internal/run", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(event),
-  });
-  const response = await worker.getEntrypoint().fetch(request);
-  if (!response.ok) throw new Error(`Script failed with status ${response.status}`);
-  const result = await response.json();
-  return result;
+  // Free-plan compatible stub.
+  // Original implementation used env.LOADER.load() (Dynamic Workers /
+  // Workers for Platforms), which requires a Workers Paid plan and fails
+  // deploy with error 10195 on Free. Custom user code is therefore skipped
+  // here so deploy + queue processing works on Free.
+  // To re-enable sandboxed actions: upgrade to Workers Paid, restore
+  // `worker_loaders: [{ "binding": "LOADER" }]` in wrangler.jsonc and the
+  // LOADER-based implementation.
+  return { event, logs: [] };
 }
 
 async function processEvent(message, env, ctx) {

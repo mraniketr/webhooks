@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "hooklane-webhook-service",
+  "name": "webhooks",
   "main": "src/index.js",
   "compatibility_date": "2026-10-02",
   "assets": {
@@ -27,9 +27,6 @@
       }
     ]
   },
-  "worker_loaders": [
-    { "binding": "LOADER" }
-  ],
   "ratelimits": [
     {
       "name": "USER_RATE_LIMITER",
