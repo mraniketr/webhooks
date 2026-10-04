@@ -1,7 +1,10 @@
+import { buildContext, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
+
 const WEBHOOK_BODY_LIMIT = 256 * 1024;
 const RATE_LIMIT = 60;
 const RATE_PERIOD = 60;
 const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
+const SUBSCRIPTION_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
 
 // Idle session timeout, configurable via env. Supports SESSION_TTL_MINUTES
 // (preferred) or SESSION_TTL_MS. Defaults to 10 minutes of inactivity.
@@ -151,21 +154,43 @@ function normalizeActions(input) {
   return out;
 }
 
+function isValidUrlTemplate(target) {
+  const t = String(target || "").trim();
+  if (!t) return false;
+  // Replace {{ ... }} with a placeholder token so templated URLs validate.
+  // (Spaces inside {{ }} are legal — only check whitespace outside them.)
+  const deTemplated = t.replace(/\{\{\s*[^}]+\s*\}\}/g, "x");
+  if (!deTemplated || /\s/.test(deTemplated)) return false;
+  try {
+    const u = new URL(deTemplated);
+    return ["http:", "https:"].includes(u.protocol);
+  } catch { return false; }
+}
+
 function normalizeSubscriptions(input) {
   if (!Array.isArray(input)) return null; // null = not provided, leave unchanged
   const out = [];
   for (const item of input) {
     const target = String(item?.target_url ?? item?.url ?? "").trim();
+    if (!isValidUrlTemplate(target)) continue;
+    const method = String(item?.http_method || item?.method || "POST").toUpperCase();
+    const payloadMode = item?.payload_mode === "custom" ? "custom" : "passthrough";
+    const payloadTemplate = item?.payload_template != null ? String(item.payload_template).slice(0, 20000) : "";
+    if (payloadMode === "custom" && !payloadTemplate.trim()) continue;
+    let headersObj = {};
     try {
-      const u = new URL(target);
-      if (!["http:", "https:"].includes(u.protocol)) continue;
-    } catch { continue; }
+      headersObj = parseHeadersJson(item?.headers_json ?? item?.headers ?? {});
+    } catch { headersObj = {}; }
     out.push({
       id: Number(item?.id) || undefined,
       name: String(item?.name || target).slice(0, 100),
       target_url: target.slice(0, 2000),
       secret: item?.secret ? String(item.secret).slice(0, 500) : null,
       enabled: item?.enabled === false ? 0 : 1,
+      http_method: SUBSCRIPTION_METHODS.includes(method) ? method : "POST",
+      headers_json: JSON.stringify(headersObj).slice(0, 10000),
+      payload_mode: payloadMode,
+      payload_template: payloadMode === "custom" ? payloadTemplate : null,
     });
   }
   return out;
@@ -180,26 +205,71 @@ async function saveActions(env, wid, actions) {
   }
 }
 
+async function ensureSubscriptionColumns(env) {
+  // Best-effort auto-migration for DBs created before the templating fields.
+  try {
+    const cols = await env.DB.prepare("PRAGMA table_info(subscriptions)").all();
+    const names = new Set((cols.results || []).map((c) => c.name));
+    if (!names.has("http_method")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN http_method TEXT DEFAULT 'POST'").run();
+    if (!names.has("headers_json")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN headers_json TEXT").run();
+    if (!names.has("payload_mode")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_mode TEXT DEFAULT 'passthrough'").run();
+    if (!names.has("payload_template")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_template TEXT").run();
+  } catch { /* D1 may disallow PRAGMA in some contexts — callers fall back */ }
+  try {
+    const ecols = await env.DB.prepare("PRAGMA table_info(events)").all();
+    const enames = new Set((ecols.results || []).map((c) => c.name));
+    if (!enames.has("query_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN query_json TEXT").run();
+  } catch { /* ignore */ }
+}
+
 async function saveSubscriptions(env, wid, subs) {
+  await ensureSubscriptionColumns(env);
   await env.DB.prepare("DELETE FROM subscriptions WHERE webhook_id=?").bind(wid).run();
   const created = now();
   for (const s of subs) {
-    await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
-      .bind(wid, s.name, s.target_url, s.secret, s.enabled, created).run();
+    try {
+      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .bind(wid, s.name, s.target_url, s.secret, s.enabled, s.http_method || "POST", s.headers_json || null, s.payload_mode || "passthrough", s.payload_template || null, created).run();
+    } catch {
+      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+        .bind(wid, s.name, s.target_url, s.secret, s.enabled, created).run();
+    }
   }
+}
+
+function subscriptionView(s) {
+  let headers = {};
+  try { headers = parseHeadersJson(s.headers_json ?? s.headers ?? {}); } catch { headers = {}; }
+  return {
+    id: s.id, name: s.name, target_url: s.target_url, enabled: s.enabled, created_at: s.created_at,
+    has_secret: s.has_secret ?? (s.secret ? 1 : 0),
+    http_method: s.http_method || "POST",
+    headers,
+    headers_json: s.headers_json ?? null,
+    payload_mode: s.payload_mode || "passthrough",
+    payload_template: s.payload_template ?? null,
+  };
 }
 
 async function webhookRelations(env, wid) {
   const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? ORDER BY phase,sort_order,id").bind(wid).all();
-  const subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
-    CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
-    FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
-  return { actions: actions.results, subscriptions: subscriptions.results };
+  let subscriptions;
+  try {
+    subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,http_method,headers_json,payload_mode,payload_template,
+      CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
+      FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+  } catch {
+    subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
+      CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
+      FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
+  }
+  return { actions: actions.results, subscriptions: (subscriptions.results || []).map(subscriptionView) };
 }
 
 async function mergeSubscriptions(env, wid, input) {
   // Update in place when an id matches (preserves the signing secret when
   // the client leaves it blank); insert new rows; delete removed rows.
+  await ensureSubscriptionColumns(env);
   const current = await env.DB.prepare("SELECT * FROM subscriptions WHERE webhook_id=?").bind(wid).all();
   const byId = new Map(current.results.map((s) => [s.id, s]));
   const seen = new Set();
@@ -208,16 +278,51 @@ async function mergeSubscriptions(env, wid, input) {
     if (id && byId.has(id)) {
       seen.add(id);
       const prev = byId.get(id);
-      await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=? WHERE id=?")
-        .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled, id).run();
+      try {
+        await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=?, http_method=?, headers_json=?, payload_mode=?, payload_template=? WHERE id=?")
+          .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled,
+            item.http_method || prev.http_method || "POST",
+            item.headers_json ?? prev.headers_json,
+            item.payload_mode || prev.payload_mode || "passthrough",
+            item.payload_mode === "custom" ? (item.payload_template || null) : null, id).run();
+      } catch {
+        await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=? WHERE id=?")
+          .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled, id).run();
+      }
     } else {
-      await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
-        .bind(wid, item.name, item.target_url, item.secret || null, item.enabled, now()).run();
+      try {
+        await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+          .bind(wid, item.name, item.target_url, item.secret || null, item.enabled,
+            item.http_method || "POST", item.headers_json || null, item.payload_mode || "passthrough",
+            item.payload_mode === "custom" ? (item.payload_template || null) : null, now()).run();
+      } catch {
+        await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
+          .bind(wid, item.name, item.target_url, item.secret || null, item.enabled, now()).run();
+      }
     }
   }
   for (const s of current.results) {
     if (!seen.has(s.id)) await env.DB.prepare("DELETE FROM subscriptions WHERE id=?").bind(s.id).run();
   }
+}
+
+async function sampleContextForWebhook(env, wid) {
+  const webhook = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(wid).first();
+  let eventRow = null;
+  try {
+    eventRow = await env.DB.prepare("SELECT * FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
+  } catch {
+    eventRow = await env.DB.prepare("SELECT id,webhook_id,method,headers_json,payload_json,raw_body,ip,received_at FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
+  }
+  if (!eventRow) {
+    const empty = buildContext(null, webhook);
+    // Seed with a representative body so the variable picker is useful pre-traffic.
+    empty.body = { event: "user.created", user: { id: 123, email: "jane@example.com" } };
+    empty.headers = { "content-type": "application/json", "x-api-key": "… " };
+    empty.query = { token: "…" };
+    return { context: empty, hasSample: false };
+  }
+  return { context: buildContext(eventRow, webhook), hasSample: true, eventId: eventRow.id };
 }
 function parsePayload(request, raw) {
   if (!raw) return null;
@@ -406,7 +511,45 @@ export default {
             d.response_preview,d.error,d.created_at,d.completed_at,s.name subscription_name
             FROM deliveries d LEFT JOIN subscriptions s ON s.id=d.subscription_id
             WHERE d.event_id=? ORDER BY d.id`).bind(event.id).all();
-          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
+          let query = {};
+          try { query = JSON.parse(event.query_json || "{}"); } catch { query = {}; }
+          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), query, payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
+        }
+
+        const contextMatch = p.match(/^\/api\/webhooks\/(\d+)\/context$/);
+        if (request.method === "GET" && contextMatch) {
+          const wid = Number(contextMatch[1]);
+          const owns = await env.DB.prepare("SELECT id FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+          const { context, hasSample, eventId } = await sampleContextForWebhook(env, wid);
+          return apiJson(user, env, ttlMs, { context, variables: listVariables(context), hasSample, eventId: eventId ?? null });
+        }
+
+        const previewMatch = p.match(/^\/api\/webhooks\/(\d+)\/subscriptions\/preview$/);
+        if (request.method === "POST" && previewMatch) {
+          const wid = Number(previewMatch[1]);
+          const owns = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+          const b = await readJson(request);
+          const normalized = normalizeSubscriptions([b.subscription || b]);
+          if (!normalized || !normalized.length) return apiJson(user, env, ttlMs, { error: "Provide a valid target_url template" }, 400);
+          const sub = normalized[0];
+          let eventRow = null;
+          const eventId = Number(b.eventId || b.event_id || 0);
+          if (eventId) {
+            eventRow = await env.DB.prepare("SELECT * FROM events WHERE id=? AND webhook_id=?").bind(eventId, wid).first()
+              .catch(() => null);
+            if (!eventRow) return apiJson(user, env, ttlMs, { error: "Event not found for this webhook" }, 404);
+          } else {
+            try {
+              eventRow = await env.DB.prepare("SELECT * FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
+            } catch {
+              eventRow = null;
+            }
+          }
+          const ctx = eventRow ? buildContext(eventRow, owns) : (await sampleContextForWebhook(env, wid)).context;
+          const rendered = renderSubscription({ ...sub, secret: undefined }, ctx);
+          return apiJson(user, env, ttlMs, { rendered, context: ctx, variables: listVariables(ctx) });
         }
       }
 
@@ -422,10 +565,20 @@ export default {
         const received = now();
         const headers = Object.fromEntries(request.headers.entries());
         const ip = request.headers.get("cf-connecting-ip") || "";
-        const insert = await env.DB.prepare(`INSERT INTO events
-          (webhook_id,method,headers_json,payload_json,raw_body,ip,status,received_at)
-          VALUES (?,?,?,?,?,?,?,?)`)
-          .bind(hook.id, request.method, JSON.stringify(headers), payload == null ? null : JSON.stringify(payload), raw, ip, "accepted", received).run();
+        const query = Object.fromEntries(url.searchParams.entries());
+        const queryJson = JSON.stringify(query);
+        let insert;
+        try {
+          insert = await env.DB.prepare(`INSERT INTO events
+            (webhook_id,method,headers_json,query_json,payload_json,raw_body,ip,status,received_at)
+            VALUES (?,?,?,?,?,?,?,?,?)`)
+            .bind(hook.id, request.method, JSON.stringify(headers), queryJson, payload == null ? null : JSON.stringify(payload), raw, ip, "accepted", received).run();
+        } catch {
+          insert = await env.DB.prepare(`INSERT INTO events
+            (webhook_id,method,headers_json,payload_json,raw_body,ip,status,received_at)
+            VALUES (?,?,?,?,?,?,?,?)`)
+            .bind(hook.id, request.method, JSON.stringify(headers), payload == null ? null : JSON.stringify(payload), raw, ip, "accepted", received).run();
+        }
         const eventId = insert.meta.last_row_id;
         await env.WEBHOOK_QUEUE.send({ eventId: Number(eventId) });
         return json({ accepted: true, eventId: Number(eventId), status: "queued" }, 202);

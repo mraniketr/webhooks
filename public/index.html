@@ -62,7 +62,7 @@
   <div class="field"><label>Status</label><select id="webhookStatus"><option value="active">active</option><option value="disabled">disabled</option></select></div>
   <div class="subhead"><span>Actions <small class="muted">JS scripts, run in order</small></span><button type="button" class="ghost sm" id="addActionBtn">+ Add action</button></div>
   <div id="actionRows"></div>
-  <div class="subhead"><span>Subscriptions <small class="muted">forward events to URLs</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
+  <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
   <div id="subRows"></div>
   <div class="callout"><b>Pipeline:</b> event is persisted, pre-actions run, payload is forwarded to each enabled subscription, then post-actions run. Deliveries are logged per event.</div>
   <div class="modal-actions"><button type="button" class="ghost" id="cancelModal">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
