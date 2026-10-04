@@ -1,24 +1,29 @@
-import { buildContext, renderSubscription } from "./template.js";
+import { buildContext, evaluatePreAssignment, renderSubscription } from "./template.js";
 
 function now() {
   return new Date().toISOString();
 }
 
-async function runUserScript(code, event, env, ctx) {
-  // Free-plan compatible stub.
-  // Original implementation used env.LOADER.load() (Dynamic Workers /
-  // Workers for Platforms), which requires a Workers Paid plan and fails
-  // deploy with error 10195 on Free. Custom user code is therefore skipped
-  // here so deploy + queue processing works on Free.
-  // To re-enable sandboxed actions: upgrade to Workers Paid, restore
-  // `worker_loaders: [{ "binding": "LOADER" }]` in wrangler configs and the
-  // LOADER-based implementation.
-  //
-  // Contract when re-enabled: the script runs with `event` mutable and may
-  // assign `pre` (a key-value object, e.g. `pre = { userId: ... }`).
-  // The returned `pre` object is stored on the event and exposed to
-  // subscriptions by key as {{ pre.<key> }}.
-  return { event, pre: {}, logs: [] };
+async function runUserScript(code, row, webhookRow) {
+  // Free-plan compatible: Workers cannot eval/new Function or load dynamic
+  // code (the LOADER/Dynamic-Workers approach needs a Workers Paid plan),
+  // so the pre-action is evaluated as data-mapping statements only:
+  // `pre = { key: value, ... }` (plus `pre.key = value` lines, in order).
+  // Values may be plain literals, {{ }} templates, or simple references
+  // like event.payload.x / body.x / headers.x / query.x. Anything else is
+  // rejected with an error surfaced on the event — never executed.
+  const event = {
+    id: row.id,
+    webhookId: row.webhook_id,
+    payload: row.payload_json ? JSON.parse(row.payload_json) : row.raw_body,
+    headers: JSON.parse(row.headers_json || "{}"),
+    ip: row.ip,
+    receivedAt: row.received_at,
+  };
+  const baseCtx = buildContext(row, webhookRow, {});
+  const { pre, error } = evaluatePreAssignment(code, baseCtx);
+  const logs = error ? [`Pre-action: ${error}`] : [];
+  return { event, pre: error ? {} : pre, logs };
 }
 
 async function ensurePreColumn(env) {
@@ -72,6 +77,7 @@ async function processEvent(message, env, ctx) {
     ip: row.ip,
     receivedAt: row.received_at,
   };
+  const webhookRow = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(row.webhook_id).first().catch(() => null);
   const logs = [];
   let pre = {};
 
@@ -79,7 +85,7 @@ async function processEvent(message, env, ctx) {
     const enabled = (actions.results || []).filter((x) => x.phase === "pre" || !x.phase);
     const action = enabled[0];
     if (action) {
-      const result = await runUserScript(action.code, event, env, ctx);
+      const result = await runUserScript(action.code, row, webhookRow);
       event = result.event;
       logs.push(...(result.logs || []));
       // Single pre-action contract: `pre` must be a key-value object.

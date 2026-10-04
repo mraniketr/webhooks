@@ -1,4 +1,4 @@
-import { buildContext, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
+import { buildContext, evaluatePreAssignment, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
 
 const WEBHOOK_BODY_LIMIT = 256 * 1024;
 const RATE_LIMIT = 60;
@@ -552,9 +552,24 @@ export default {
               eventRow = null;
             }
           }
-          const ctx = eventRow ? buildContext(eventRow, owns) : (await sampleContextForWebhook(env, wid)).context;
+          const baseCtx = eventRow
+            ? buildContext(eventRow, owns, {})
+            : { ...(await sampleContextForWebhook(env, wid)).context, pre: {} };
+          let ctx = eventRow ? buildContext(eventRow, owns) : baseCtx;
+          let preError = null;
+          try {
+            const action = await env.DB.prepare("SELECT code FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order,id LIMIT 1").bind(wid).first();
+            if (action && action.code && String(action.code).trim()) {
+              const r = evaluatePreAssignment(action.code, baseCtx);
+              if (r.error) {
+                preError = r.error;
+              } else {
+                ctx = eventRow ? buildContext(eventRow, owns, r.pre) : { ...baseCtx, pre: r.pre };
+              }
+            }
+          } catch { /* fall back to ctx above */ }
           const rendered = renderSubscription({ ...sub, secret: undefined }, ctx);
-          return apiJson(user, env, ttlMs, { rendered, context: ctx, variables: listVariables(ctx) });
+          return apiJson(user, env, ttlMs, { rendered, context: ctx, variables: listVariables(ctx), pre: ctx.pre, preError });
         }
       }
 

@@ -108,6 +108,330 @@ function stringifyForBody(value) {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
+// ---------------------------------------------------------------------------
+// Safe pre-action evaluation (no arbitrary JS execution).
+//
+// Workers on the Free plan cannot eval/new Function or load dynamic code, so
+// the pre-action is evaluated as data-mapping statements only:
+//
+//   pre = { key: value, ... }      (replaces the whole pre object)
+//   pre.key = value                (applied in order)
+//   pre["key"] = value
+//
+// Values may be plain literals (lenient JSON: unquoted keys, single quotes,
+// trailing commas), {{ }} templates (rendered against the inbound event), or
+// simple references like event.payload.userId / body.userId / headers.x-api-key
+// / query.token / method / ip. Bare words (e.g. {tag: vip}) are kept as
+// strings. Anything else (function calls, operators, loops, fetch, ...) is
+// rejected with an explanatory error — never executed.
+//
+// Returns { pre, error }. On error, pre is {}.
+// ---------------------------------------------------------------------------
+
+function stripJsComments(s) {
+  let out = "";
+  let i = 0;
+  const n = s.length;
+  let q = null;
+  while (i < n) {
+    const c = s[i];
+    if (q) {
+      out += c;
+      if (c === "\\" && i + 1 < n) { out += s[i + 1]; i += 2; continue; }
+      if (c === q) q = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") { q = c; out += c; i++; continue; }
+    if (c === "/" && s[i + 1] === "/") {
+      while (i < n && s[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && s[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(s[i] === "*" && s[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+function lookupPreRef(token, ctx) {
+  const parts = String(token).split(".").map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) return undefined;
+  const root = parts[0];
+  const rest = parts.slice(1);
+  if (root === "body" || root === "headers" || root === "query" || root === "event" || root === "webhook") {
+    return getPath(ctx[root] ?? {}, rest);
+  }
+  if (root === "payload") {
+    // alias for body
+    return getPath(ctx.body ?? {}, rest);
+  }
+  if (root === "method" || root === "ip") {
+    return rest.length === 0 ? ctx[root] : undefined;
+  }
+  return undefined;
+}
+
+function coerceTemplateValue(s) {
+  if (s === "") return null;
+  try { return JSON.parse(s); } catch { return s; }
+}
+
+function parseQuoted(st) {
+  const t = st.t;
+  const q = t[st.i];
+  let i = st.i + 1;
+  let out = "";
+  const escapes = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", 0: "\0" };
+  while (i < t.length) {
+    const c = t[i];
+    if (c === "\\" && i + 1 < t.length) {
+      const e = t[i + 1];
+      out += e in escapes ? escapes[e] : e;
+      i += 2;
+      continue;
+    }
+    if (c === q) { st.i = i + 1; return { value: out }; }
+    out += c;
+    i++;
+  }
+  st.i = i;
+  return { value: out }; // unterminated — lenient, take the rest
+}
+
+function skipWsSt(st) {
+  while (st.i < st.t.length && /\s/.test(st.t[st.i])) st.i++;
+}
+
+function parsePreValue(st, ctx) {
+  skipWsSt(st);
+  const t = st.t;
+  const c = t[st.i];
+  if (c === undefined) return { error: "Unexpected end of pre-action while reading a value." };
+  if (c === "{" && t[st.i + 1] === "{") {
+    const end = t.indexOf("}}", st.i + 2);
+    if (end === -1) return { error: "Unclosed {{ }} placeholder in pre-action." };
+    const expr = t.slice(st.i + 2, end);
+    st.i = end + 2;
+    return { value: coerceTemplateValue(resolveVariable(expr, ctx)) };
+  }
+  if (c === "{") return parsePreObject(st, ctx);
+  if (c === "[") return parsePreArray(st, ctx);
+  if (c === '"' || c === "'" || c === "`") {
+    const q = parseQuoted(st);
+    return { value: renderString(q.value, ctx) };
+  }
+  const numMatch = t.slice(st.i).match(/^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/);
+  if (c === "-" || (c >= "0" && c <= "9") || (c === "." && t[st.i + 1] >= "0" && t[st.i + 1] <= "9")) {
+    if (!numMatch) return { error: `Could not read a number in pre-action near "${t.slice(st.i, st.i + 12)}".` };
+    st.i += numMatch[1].length;
+    return { value: Number(numMatch[1]) };
+  }
+  if (/[A-Za-z_$]/.test(c)) {
+    let j = st.i;
+    while (j < t.length && /[A-Za-z0-9_$]/.test(t[j])) j++;
+    const word = t.slice(st.i, j);
+    if (t[j] === "(") {
+      return { error: `Function calls like ${word}(...) are not evaluated — use plain values, {{ }} templates, or references like event.payload.x.` };
+    }
+    // Dotted reference (header names may contain hyphens).
+    let k = j;
+    const segs = [word];
+    while (t[k] === ".") {
+      let m = k + 1;
+      while (m < t.length && /\s/.test(t[m])) m++;
+      let e = m;
+      while (e < t.length && /[A-Za-z0-9_$-]/.test(t[e])) e++;
+      if (e === m) break;
+      segs.push(t.slice(m, e));
+      k = e;
+    }
+    if (segs.length === 1) {
+      if (word === "true") { st.i = j; return { value: true }; }
+      if (word === "false") { st.i = j; return { value: false }; }
+      if (word === "null") { st.i = j; return { value: null }; }
+      if (["body", "headers", "query", "event", "webhook", "payload", "method", "ip"].includes(word)) {
+        st.i = j;
+        const v = lookupPreRef(word, ctx);
+        return { value: v === undefined ? null : v };
+      }
+      // Lenient: other bare words are kept as strings, e.g. {tag: vip}.
+      st.i = j;
+      return { value: word };
+    }
+    st.i = k;
+    const full = segs.join(".");
+    if (!["body", "headers", "query", "event", "webhook", "payload", "method", "ip"].includes(segs[0])) {
+      return { error: `Unknown reference "${full}" — use event.payload.x, body.x, headers.x, query.x, method, ip, or quote it as a string.` };
+    }
+    const v = lookupPreRef(full, ctx);
+    return { value: v === undefined ? null : v };
+  }
+  return { error: `Only plain values, {{ }} templates, or references like event.payload.x are supported in pre-actions (found "${t.slice(st.i, st.i + 12)}").` };
+}
+
+function parsePreObject(st, ctx) {
+  const obj = {};
+  st.i++; // {
+  while (true) {
+    skipWsSt(st);
+    if (st.t[st.i] === "}") { st.i++; return { value: obj }; }
+    if (st.i >= st.t.length) return { error: "Unclosed { in pre-action." };
+    let key;
+    const c = st.t[st.i];
+    if (c === '"' || c === "'" || c === "`") {
+      key = parseQuoted(st).value;
+    } else if (/[A-Za-z_$]/.test(c)) {
+      let j = st.i;
+      while (j < st.t.length && /[A-Za-z0-9_$-]/.test(st.t[j])) j++;
+      key = st.t.slice(st.i, j);
+      st.i = j;
+    } else {
+      return { error: `Expected a key in pre-action object (found "${st.t.slice(st.i, st.i + 12)}").` };
+    }
+    skipWsSt(st);
+    if (st.t[st.i] !== ":") return { error: `Expected ":" after key "${key}" in pre-action.` };
+    st.i++;
+    const v = parsePreValue(st, ctx);
+    if (v.error) return v;
+    obj[key] = v.value;
+    skipWsSt(st);
+    if (st.t[st.i] === ",") { st.i++; continue; }
+    if (st.t[st.i] === "}") continue;
+    if (st.i >= st.t.length) return { error: "Unclosed { in pre-action." };
+    return { error: `Expected "," or "}" in pre-action object (found "${st.t.slice(st.i, st.i + 12)}").` };
+  }
+}
+
+function parsePreArray(st, ctx) {
+  const arr = [];
+  st.i++; // [
+  while (true) {
+    skipWsSt(st);
+    if (st.t[st.i] === "]") { st.i++; return { value: arr }; }
+    if (st.i >= st.t.length) return { error: "Unclosed [ in pre-action." };
+    const v = parsePreValue(st, ctx);
+    if (v.error) return v;
+    arr.push(v.value);
+    skipWsSt(st);
+    if (st.t[st.i] === ",") { st.i++; continue; }
+    if (st.t[st.i] === "]") continue;
+    return { error: `Expected "," or "]" in pre-action array (found "${st.t.slice(st.i, st.i + 12)}").` };
+  }
+}
+
+function skipQuotedSt(st) {
+  const t = st.t;
+  const q = t[st.i];
+  let i = st.i + 1;
+  while (i < t.length) {
+    if (t[i] === "\\") { i += 2; continue; }
+    if (t[i] === q) { st.i = i + 1; return; }
+    i++;
+  }
+  st.i = i;
+}
+
+function setPrePath(pre, keys, value) {
+  let cur = pre;
+  for (let d = 0; d < keys.length - 1; d++) {
+    if (!cur[keys[d]] || typeof cur[keys[d]] !== "object" || Array.isArray(cur[keys[d]])) cur[keys[d]] = {};
+    cur = cur[keys[d]];
+  }
+  cur[keys[keys.length - 1]] = value;
+}
+
+function evaluatePreAssignment(code, baseCtx) {
+  const text = String(code || "");
+  if (!text.trim()) return { pre: {}, error: null };
+  const t = stripJsComments(text);
+  const st = { t, i: 0 };
+  const ctx = baseCtx || {};
+  let pre = {};
+  let sawPre = false;
+  const isIdStart = (c) => /[A-Za-z_$]/.test(c || "");
+  const isIdChar = (c) => /[A-Za-z0-9_$]/.test(c || "");
+  while (true) {
+    while (st.i < t.length && /\s/.test(t[st.i])) st.i++;
+    if (st.i >= t.length) break;
+    const c = t[st.i];
+    if (c === '"' || c === "'" || c === "`") { skipQuotedSt(st); continue; }
+    if (c === ";") { st.i++; continue; }
+    if (isIdStart(c)) {
+      let j = st.i;
+      while (j < t.length && isIdChar(t[j])) j++;
+      if (t.slice(st.i, j) !== "pre" || (j < t.length && isIdChar(t[j]))) {
+        st.i = j;
+        continue;
+      }
+      // Found `pre` — parse optional .key / ["key"] path, then require `=`.
+      const save = st.i;
+      let k = j;
+      const keys = [];
+      let ok = true;
+      while (true) {
+        let m = k;
+        while (m < t.length && /\s/.test(t[m])) m++;
+        if (t[m] === ".") {
+          m++;
+          while (m < t.length && /\s/.test(t[m])) m++;
+          let e = m;
+          while (e < t.length && /[A-Za-z0-9_$-]/.test(t[e])) e++;
+          if (e === m) { ok = false; break; }
+          keys.push(t.slice(m, e));
+          k = e;
+        } else if (t[m] === "[") {
+          let p = m + 1;
+          while (p < t.length && /\s/.test(t[p])) p++;
+          const q = t[p];
+          if (q !== '"' && q !== "'") { ok = false; break; }
+          const qs = { t, i: p };
+          const keyVal = parseQuoted(qs).value;
+          p = qs.i;
+          while (p < t.length && /\s/.test(t[p])) p++;
+          if (t[p] !== "]") { ok = false; break; }
+          keys.push(keyVal);
+          k = p + 1;
+        } else {
+          break;
+        }
+      }
+      let m = k;
+      while (m < t.length && /\s/.test(t[m])) m++;
+      if (!ok || t[m] !== "=" || t[m + 1] === "=" || t[m + 1] === ">") {
+        st.i = save + 3; // not an assignment (e.g. `pre == x`) — skip past `pre`
+        continue;
+      }
+      st.i = m + 1;
+      const v = parsePreValue(st, ctx);
+      if (v.error) return { pre: {}, error: v.error };
+      if (keys.length === 0) {
+        if (!v.value || typeof v.value !== "object" || Array.isArray(v.value)) {
+          return { pre: {}, error: "`pre` must be assigned an object, e.g. pre = { key: value }." };
+        }
+        pre = v.value;
+      } else {
+        setPrePath(pre, keys, v.value);
+      }
+      sawPre = true;
+      continue;
+    }
+    st.i++;
+  }
+  if (!sawPre) {
+    if (/\boutput\s*=/.test(t)) {
+      return { pre: {}, error: "Found `output = ...` — assign `pre = { key: value }` instead (single pre-action contract)." };
+    }
+    return { pre: {}, error: "No `pre = { key: value }` assignment found — assign a key-value object to `pre`." };
+  }
+  return { pre, error: null };
+}
+
 // Build the template context from a stored event row + webhook row.
 // preOutputs (optional) overrides eventRow.pre_json when provided.
 // pre is always a plain key-value object.
@@ -144,6 +468,7 @@ function buildContext(eventRow, webhookRow, preOutputs) {
       id: eventRow?.id ?? null,
       webhook_id: eventRow?.webhook_id ?? webhookRow?.id ?? null,
       received_at: eventRow?.received_at || null,
+      payload: body,
     },
     webhook: {
       id: webhookRow?.id ?? eventRow?.webhook_id ?? null,
@@ -298,6 +623,7 @@ function renderSubscription(sub, ctx) {
 
 export {
   buildContext,
+  evaluatePreAssignment,
   extractPlaceholders,
   flattenPaths,
   getPath,

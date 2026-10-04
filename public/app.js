@@ -2,6 +2,7 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 let authMode = 'login', currentPage = 'dashboard', currentWebhook = null, user = null;
 let editingId = null;
+let editingPre = null;
 let editingSubs = [];
 let editingSubIndex = null; // null | number ('new' uses -1)
 let varCache = { wid: null, variables: null, hasSample: false };
@@ -32,18 +33,21 @@ function showPage(page) {
   currentPage = page;
   $$('.page').forEach(x => x.classList.add('hidden'));
   $(`#page-${page}`).classList.remove('hidden');
-  const navFor = page === 'detail' ? 'webhooks' : page;
+  const navFor = ['detail', 'edit', 'subedit', 'preedit'].includes(page) ? 'webhooks' : page;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === navFor));
   const titles = {
     dashboard: ['Overview', 'Webhook health at a glance'],
-    webhooks: ['Webhooks', 'Endpoints and event streams'],
-    detail: ['Webhooks', 'Webhook details'],
-    edit: ['Webhooks', 'Create or edit endpoint'],
-    subedit: ['Webhooks', 'Edit one subscription'],
+    webhooks: ['Webhooks', 'All Webhooks'],
+    detail: ['All Webhooks', 'Webhook details'],
+    edit: ['All Webhooks', 'Create or edit endpoint'],
+    subedit: ['All Webhooks', 'Edit one subscription'],
+    preedit: ['All Webhooks', 'Edit pre-action'],
   };
   const [eyebrow, title] = titles[page] || titles.webhooks;
   $('#pageEyebrow').textContent = eyebrow;
   $('#pageTitle').textContent = title;
+  const newBtn = $('#newWebhookBtn');
+  if (newBtn) newBtn.classList.toggle('hidden', page !== 'webhooks');
   if (page === 'dashboard') loadDashboard(); else if (page === 'webhooks') loadWebhooks();
   window.scrollTo(0, 0);
 }
@@ -72,6 +76,14 @@ $('#authForm').onsubmit = async e => {
 $('#logoutBtn').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); user = null; showAuth(); };
 $$('[data-page]').forEach(b => b.onclick = () => showPage(b.dataset.page));
 
+function normalizePreForEditor(a = {}) {
+  return {
+    id: a.id || undefined,
+    name: a.name || '',
+    enabled: (a.enabled ?? 1) ? 1 : 0,
+    code: a.code || '',
+  };
+}
 function normalizeSubForEditor(s = {}) {
   let headers = s.headers && typeof s.headers === 'object' ? s.headers
     : (() => { try { return JSON.parse(s.headers_json || '{}'); } catch { return {}; } })();
@@ -90,13 +102,12 @@ function normalizeSubForEditor(s = {}) {
 }
 function openCreate() {
   editingId = null; varCache = { wid: null, variables: null, hasSample: false };
-  editingSubs = []; editingSubIndex = null;
+  editingPre = normalizePreForEditor({}); editingSubs = []; editingSubIndex = null;
   $('#editEyebrow').textContent = 'NEW ENDPOINT';
   $('#editTitle').textContent = 'Create webhook';
   $('#webhookSubmit').textContent = 'Create webhook';
   $('#webhookName').value = ''; $('#webhookStatus').value = 'active';
-  $('#actionRows').innerHTML = '';
-  $('#actionRows').append(actionRow({ phase: 'pre' }));
+  renderPreSummary();
   renderSubList();
   showPage('edit');
 }
@@ -110,8 +121,8 @@ async function openEdit(id) {
     $('#webhookSubmit').textContent = 'Save changes';
     $('#webhookName').value = d.webhook.name;
     $('#webhookStatus').value = d.webhook.status || 'active';
-    $('#actionRows').innerHTML = '';
-    $('#actionRows').append(actionRow(d.actions[0] || {}));
+    editingPre = normalizePreForEditor(d.actions[0] || {});
+    renderPreSummary();
     editingSubs = (d.subscriptions || []).map(normalizeSubForEditor);
     renderSubList();
     showPage('edit');
@@ -124,14 +135,46 @@ function cancelEdit() {
   if (id) openWebhook(id); else showPage('webhooks');
 }
 
-function actionRow(a = {}) {
-  const d = document.createElement('div');
-  d.className = 'row-card'; d.dataset.id = a.id || '';
-  d.innerHTML = '<div class="row-grid"><input data-k="name" placeholder="Pre-action name" maxlength="100"/><select data-k="enabled"><option value="1">enabled</option><option value="0">disabled</option></select></div><textarea data-k="code" placeholder="// event.payload is available; set pre = { key: value } to expose {{ pre.key }} to subscriptions"></textarea><div class="row-foot"><span class="muted" style="font-size:11px">single pre-action · <code>pre</code> is a key-value object, subscriptions use <code>{{ pre.key }}</code></span></div>';
-  d.querySelector('[data-k="name"]').value = a.name || '';
-  d.querySelector('[data-k="enabled"]').value = String(a.enabled ?? 1);
-  d.querySelector('[data-k="code"]').value = a.code || '';
-  return d;
+function renderPreSummary() {
+  const box = $('#preSummary');
+  if (!box) return;
+  const p = editingPre || {};
+  if (!p.code || !String(p.code).trim()) {
+    box.innerHTML = '<div class="empty">No pre-action yet. Edit it to set a <code>pre</code> key-value object for subscriptions.</div>';
+    return;
+  }
+  const preview = String(p.code).slice(0, 220);
+  box.innerHTML = '';
+  const row = document.createElement('div');
+  row.className = 'hook-row sub-list-row';
+  row.innerHTML = `<div><strong>${esc(p.name || 'Pre-action')}</strong>`
+    + `<small class="mono">${esc(preview)}${String(p.code).length > 220 ? '…' : ''}</small>`
+    + `<small>${p.enabled ? 'enabled' : 'disabled'} · sets <code>pre</code> object, subscriptions use <code>{{ pre.key }}</code></small></div>`
+    + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
+  row.querySelector('button').onclick = () => openPreEditor();
+  box.append(row);
+}
+
+function openPreEditor() {
+  const p = editingPre || normalizePreForEditor({});
+  $('#preName').value = p.name || '';
+  $('#preEnabled').value = String(p.enabled ?? 1);
+  $('#preCode').value = p.code || '';
+  showPage('preedit');
+}
+
+function closePreEditor() {
+  showPage('edit');
+}
+
+function collectPreEditor() {
+  const prev = editingPre || {};
+  return {
+    id: prev.id || undefined,
+    name: $('#preName').value.trim(),
+    enabled: $('#preEnabled').value !== '0' ? 1 : 0,
+    code: $('#preCode').value,
+  };
 }
 
 function headerEditorRow(k = '', v = '') {
@@ -294,12 +337,10 @@ function toggleSubVarPanel() {
 }
 
 function collectActions() {
-  // Single pre-action only.
-  const rows = [...$('#actionRows').children].slice(0, 1).map(c => {
-    const g = k => c.querySelector('[data-k="' + k + '"]').value;
-    return { id: c.dataset.id || undefined, name: g('name').trim(), enabled: g('enabled') !== '0', phase: 'pre', code: g('code') };
-  }).filter(o => o.code.trim());
-  return rows.slice(0, 1);
+  // Single pre-action only, held in editingPre state (edited on page-preedit).
+  const p = editingPre || {};
+  if (!p.code || !String(p.code).trim()) return [];
+  return [{ id: p.id || undefined, name: (p.name || '').trim(), enabled: p.enabled !== 0, phase: 'pre', code: p.code }];
 }
 
 async function previewSingleSubscription() {
@@ -315,7 +356,8 @@ async function previewSingleSubscription() {
   try {
     const d = await api('/api/webhooks/' + editingId + '/subscriptions/preview', { method: 'POST', body: JSON.stringify({ subscription: subToApi(sub) }) });
     const r = d.rendered;
-    box.innerHTML = `${r.errors?.length ? `<div class="preview-err">${r.errors.map(esc).join('<br/>')}</div>` : '<div class="preview-ok">Rendered OK</div>'}`
+    box.innerHTML = `${d.preError ? `<div class="preview-err">Pre-action: ${esc(d.preError)}</div>` : ''}`
+      + `${r.errors?.length ? `<div class="preview-err">${r.errors.map(esc).join('<br/>')}</div>` : '<div class="preview-ok">Rendered OK</div>'}`
       + `<div class="preview-grid"><div><span>METHOD</span><code>${esc(r.method)}</code></div><div><span>URL</span><code>${esc(r.url)}</code></div></div>`
       + `${Object.keys(r.headers || {}).length ? `<div><span>HEADERS</span><pre>${esc(JSON.stringify(r.headers, null, 2))}</pre></div>` : '<div class="muted">No custom headers.</div>'}`
       + `<div><span>BODY</span><pre>${esc((r.bodyText || '').slice(0, 2000))}</pre></div>`;
@@ -336,7 +378,9 @@ async function persistSubscriptionsAfterSubSave() {
 }
 
 ['#newWebhookBtn', '#newWebhookBtn2'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
-const addActionBtn = $('#addActionBtn'); if (addActionBtn) addActionBtn.onclick = () => { if (!$('#actionRows').children.length) $('#actionRows').append(actionRow({})); };
+const preEditBtn = $('#preEditBtn'); if (preEditBtn) preEditBtn.onclick = () => openPreEditor();
+const backToEditFromPre = $('#backToEditFromPre'); if (backToEditFromPre) backToEditFromPre.onclick = closePreEditor;
+const cancelPreEdit = $('#cancelPreEdit'); if (cancelPreEdit) cancelPreEdit.onclick = closePreEditor;
 $('#addSubBtn').onclick = () => openSubEditor(-1);
 $('#cancelEdit').onclick = cancelEdit;
 $('#backToWebhooks').onclick = cancelEdit;
@@ -371,6 +415,23 @@ $('#subEditForm').onsubmit = async e => {
     renderSubList();
     showPage('edit');
   } catch (err) { toast(err.message, true); }
+};
+const preEditForm = $('#preEditForm');
+if (preEditForm) preEditForm.onsubmit = async e => {
+  e.preventDefault();
+  const draft = collectPreEditor();
+  editingPre = { ...draft, id: (editingPre && editingPre.id) || undefined };
+  if (editingId) {
+    try {
+      const saved = await persistSubscriptionsAfterSubSave();
+      if (saved?.actions) editingPre = normalizePreForEditor(saved.actions[0] || editingPre);
+      toast(editingPre.code && String(editingPre.code).trim() ? 'Pre-action saved' : 'Pre-action cleared');
+    } catch (err) { toast(err.message, true); return; }
+  } else {
+    toast('Pre-action updated — save webhook to apply');
+  }
+  renderPreSummary();
+  showPage('edit');
 };
 $('#closeEventModal').onclick = () => $('#eventModal').classList.add('hidden');
 $('#webhookForm').onsubmit = async e => {
