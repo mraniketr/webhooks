@@ -13,7 +13,21 @@ async function runUserScript(code, event, env, ctx) {
   // To re-enable sandboxed actions: upgrade to Workers Paid, restore
   // `worker_loaders: [{ "binding": "LOADER" }]` in wrangler configs and the
   // LOADER-based implementation.
-  return { event, logs: [] };
+  //
+  // Contract when re-enabled: the script runs with `event` mutable and may
+  // assign `output` (any JSON-serializable value). The returned `output`
+  // becomes one entry in the event's `pre[]` array (index = action order),
+  // exposed to subscriptions as {{ pre.0 }}, {{ pre.0.field }}, etc.
+  return { event, output: undefined, logs: [] };
+}
+
+async function ensurePreColumn(env) {
+  try {
+    const cols = await env.DB.prepare("PRAGMA table_info(events)").all();
+    const names = new Set((cols.results || []).map((c) => c.name));
+    if (!names.has("pre_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN pre_json TEXT").run();
+    return names.has("pre_json");
+  } catch { return false; }
 }
 
 async function hmacHex(secret, bodyText) {
@@ -33,8 +47,9 @@ function payloadText(payload) {
   return typeof payload === "string" ? payload : JSON.stringify(payload);
 }
 
-// Main queue: run pre-actions, persist the event, fan out one task per
-// enabled subscription into the delivery queue, run post-actions, ack.
+// Main queue: run pre-actions (each may produce an `output` object collected
+// into pre[]), persist the event + pre[], fan out one task per enabled
+// subscription into the delivery queue, ack.
 // Delivery failures never fail this handler — each delivery task carries
 // its own retry budget on the delivery queue.
 async function processEvent(message, env, ctx) {
@@ -42,10 +57,13 @@ async function processEvent(message, env, ctx) {
   const row = await env.DB.prepare("SELECT * FROM events WHERE id=?").bind(eventId).first();
   if (!row) return;
   const actions = await env.DB.prepare(
-    "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 ORDER BY phase, sort_order, id"
+    "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
   )
     .bind(row.webhook_id)
-    .all();
+    .all()
+    .catch(async () => await env.DB.prepare(
+      "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 ORDER BY sort_order, id"
+    ).bind(row.webhook_id).all());
   let event = {
     id: row.id,
     webhookId: row.webhook_id,
@@ -55,19 +73,40 @@ async function processEvent(message, env, ctx) {
     receivedAt: row.received_at,
   };
   const logs = [];
+  const pre = [];
 
   try {
-    for (const a of actions.results.filter((x) => x.phase === "pre")) {
+    for (const a of (actions.results || []).filter((x) => x.phase === "pre" || !x.phase)) {
       const result = await runUserScript(a.code, event, env, ctx);
       event = result.event;
       logs.push(...(result.logs || []));
+      // Index-stable: pre[i] corresponds to the i-th enabled pre-action.
+      pre.push(result.output === undefined ? null : result.output);
     }
 
-    await env.DB.prepare(
-      "UPDATE events SET payload_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
-    )
-      .bind(event.payload == null ? null : JSON.stringify(event.payload), now(), eventId)
-      .run();
+    const preJson = JSON.stringify(pre);
+    const hasPreCol = await ensurePreColumn(env);
+    if (hasPreCol) {
+      await env.DB.prepare(
+        "UPDATE events SET payload_json=?, pre_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
+      )
+        .bind(event.payload == null ? null : JSON.stringify(event.payload), preJson, now(), eventId)
+        .run();
+    } else {
+      try {
+        await env.DB.prepare(
+          "UPDATE events SET payload_json=?, pre_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
+        )
+          .bind(event.payload == null ? null : JSON.stringify(event.payload), preJson, now(), eventId)
+          .run();
+      } catch {
+        await env.DB.prepare(
+          "UPDATE events SET payload_json=?, status='processed', error=NULL, processed_at=? WHERE id=?"
+        )
+          .bind(event.payload == null ? null : JSON.stringify(event.payload), now(), eventId)
+          .run();
+      }
+    }
 
     const subs = await env.DB.prepare(
       "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
@@ -76,12 +115,6 @@ async function processEvent(message, env, ctx) {
       .all();
     for (const sub of subs.results) {
       await env.DELIVERY_QUEUE.send({ eventId, subscriptionId: sub.id });
-    }
-
-    for (const a of actions.results.filter((x) => x.phase === "post")) {
-      const result = await runUserScript(a.code, event, env, ctx);
-      event = result.event;
-      logs.push(...(result.logs || []));
     }
 
     if (logs.length) {

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
 CREATE TABLE IF NOT EXISTS actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   webhook_id INTEGER NOT NULL,
-  phase TEXT NOT NULL CHECK(phase IN ('pre','post')),
+  phase TEXT NOT NULL DEFAULT 'pre' CHECK(phase IN ('pre')),
   name TEXT NOT NULL,
   code TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS events (
   headers_json TEXT NOT NULL,
   query_json TEXT,
   payload_json TEXT,
+  pre_json TEXT,
   raw_body TEXT,
   ip TEXT,
   status TEXT NOT NULL DEFAULT 'accepted',

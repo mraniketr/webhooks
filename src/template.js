@@ -6,7 +6,10 @@
 //   (everything after || or | is treated as a literal default, quotes stripped)
 //
 // Context shape built by buildContext():
-//   { body, headers, query, method, ip, event, webhook }
+//   { body, headers, query, method, ip, event, webhook, pre }
+// pre is an array: pre[i] is the `output` object produced by the i-th
+// enabled pre-action (in sort order). Subscriptions access it like any
+// other variable, e.g. {{ pre.0.userId }} or {{ pre.0.plan || "free" }}.
 
 function getPath(obj, parts) {
   let cur = obj;
@@ -59,9 +62,9 @@ function resolveVariable(expr, ctx) {
   if (!parts.length) return fallback ?? "";
   const root = parts[0];
   let value;
-  if (root === "body" || root === "headers" || root === "query" || root === "event" || root === "webhook") {
+  if (root === "body" || root === "headers" || root === "query" || root === "event" || root === "webhook" || root === "pre") {
     value = getPath(ctx[root] ?? {}, parts.slice(1));
-    // bare {{ body }} / {{ headers }} returns the whole object
+    // bare {{ body }} / {{ pre }} returns the whole object
     if (parts.length === 1) value = ctx[root];
   } else if (root === "method" || root === "ip") {
     value = parts.length === 1 ? ctx[root] : undefined;
@@ -105,7 +108,8 @@ function stringifyForBody(value) {
 }
 
 // Build the template context from a stored event row + webhook row.
-function buildContext(eventRow, webhookRow) {
+// preOutputs (optional) overrides eventRow.pre_json when provided.
+function buildContext(eventRow, webhookRow, preOutputs) {
   let body = null;
   if (eventRow) {
     if (eventRow.payload_json) {
@@ -119,6 +123,15 @@ function buildContext(eventRow, webhookRow) {
   let query = {};
   try { headers = JSON.parse(eventRow?.headers_json || "{}"); } catch { headers = {}; }
   try { query = JSON.parse(eventRow?.query_json || "{}"); } catch { query = {}; }
+  let pre = [];
+  if (preOutputs !== undefined) {
+    pre = Array.isArray(preOutputs) ? preOutputs : [];
+  } else if (eventRow && eventRow.pre_json != null) {
+    try {
+      const parsed = typeof eventRow.pre_json === "string" ? JSON.parse(eventRow.pre_json) : eventRow.pre_json;
+      pre = Array.isArray(parsed) ? parsed : [];
+    } catch { pre = []; }
+  }
   return {
     body,
     headers,
@@ -134,6 +147,7 @@ function buildContext(eventRow, webhookRow) {
       id: webhookRow?.id ?? eventRow?.webhook_id ?? null,
       name: webhookRow?.name || "",
     },
+    pre,
   };
 }
 
@@ -170,6 +184,7 @@ function listVariables(ctx) {
     { variable: "{{ webhook.id }}", description: "Webhook id", sample: ctx?.webhook?.id ?? "" },
     { variable: "{{ webhook.name }}", description: "Webhook name", sample: ctx?.webhook?.name ?? "" },
     { variable: "{{ body }}", description: "Full parsed body (object or { _raw })", sample: "" },
+    { variable: "{{ pre }}", description: "All pre-hook outputs (array)", sample: "" },
   ];
   const dynamic = [];
   const push = (variable, description, sample) => {
@@ -192,6 +207,20 @@ function listVariables(ctx) {
   }
   if (ctx?.body && typeof ctx.body === "object" && "_raw" in ctx.body) {
     push("{{ body._raw }}", "Raw body (non-JSON payloads)", ctx.body._raw);
+  }
+  const pre = (ctx && ctx.pre) || [];
+  if (Array.isArray(pre) && pre.length) {
+    pre.forEach((entry, i) => {
+      push(`{{ pre.${i} }}`, `Output of pre-hook #${i + 1}`, entry);
+      const paths = [];
+      flattenPaths(`pre.${i}`, entry ?? {}, paths);
+      for (const p of paths.slice(0, 20)) {
+        if (p === `pre.${i}`) continue;
+        push(`{{ ${p} }}`, `Field from pre-hook #${i + 1}`, getPath({ pre }, p.split(".")));
+      }
+    });
+  } else {
+    push("{{ pre.0 }}", "Output of first pre-hook (per event)", "");
   }
   return { base, dynamic };
 }

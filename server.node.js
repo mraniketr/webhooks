@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
 CREATE TABLE IF NOT EXISTS actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   webhook_id INTEGER NOT NULL,
-  phase TEXT NOT NULL CHECK(phase IN ('pre','post')),
+  phase TEXT NOT NULL DEFAULT 'pre' CHECK(phase IN ('pre')),
   name TEXT NOT NULL,
   code TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
@@ -102,7 +102,7 @@ const statements = {
       SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) AS failed
     FROM webhooks w LEFT JOIN events e ON e.webhook_id=w.id
     WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`),
-  actionsForWebhook: db.prepare('SELECT * FROM actions WHERE webhook_id=? ORDER BY phase, sort_order, id'),
+  actionsForWebhook: db.prepare("SELECT * FROM actions WHERE webhook_id=? AND phase='pre' ORDER BY sort_order, id"),
   insertAction: db.prepare('INSERT INTO actions (webhook_id,phase,name,code,sort_order,enabled) VALUES (?,?,?,?,?,?)'),
   deleteActions: db.prepare('DELETE FROM actions WHERE webhook_id=?'),
   insertEvent: db.prepare(`INSERT INTO events (webhook_id,method,headers_json,payload_json,raw_body,ip,received_at) VALUES (?,?,?,?,?,?,?)`),
@@ -229,16 +229,19 @@ function sanitizeUser(user){ return {id:user.id,name:user.name,email:user.email,
 function sanitizeWebhook(w){ return {id:w.id,name:w.name,url:`${PUBLIC_BASE}/webhooks/${w.token}`,token:w.token,status:w.status,created_at:w.created_at}; }
 
 function runScript(action, event) {
+  // Pre-action contract: script may assign `output` (any JSON value).
+  // Collected into pre[] and exposed to subscriptions as {{ pre.0 }}, etc.
   const logs=[];
   const context={
     event: JSON.parse(JSON.stringify(event)),
+    output: undefined,
     log: (...args)=>logs.push(args.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')),
     setStatus: s=>{ context.event.statusOverride=String(s); },
   };
   vm.createContext(context);
   const script = new vm.Script(`"use strict";\n${action.code}`);
   script.runInContext(context,{timeout:500});
-  return {event:context.event, logs};
+  return {event:context.event, output:context.output, logs};
 }
 
 async function processOneJob() {
@@ -257,15 +260,10 @@ async function processOneJob() {
       const r=runScript(a, mutableEvent);
       mutableEvent=r.event;
     }
-    const postLog=[];
-    for (const a of actions.filter(x=>x.phase==='post')) {
-      const r=runScript(a, mutableEvent);
-      mutableEvent=r.event; postLog.push(...r.logs);
-    }
     const override=mutableEvent.statusOverride;
     const finalStatus=override==='failed'?'failed':'processed';
-    statements.markEventStatus.run(finalStatus, postLog.length?postLog.join('\n'):null, now(), event.id);
-    statements.markJobDone.run('done', postLog.length?postLog.join('\n'):null, job.id);
+    statements.markEventStatus.run(finalStatus, null, now(), event.id);
+    statements.markJobDone.run('done', null, job.id);
   } catch (e) {
     statements.markEventStatus.run('failed', e.message, now(), event.id);
     if (job.attempts < 3) {
@@ -327,7 +325,7 @@ async function router(req,res) {
       const b=await readJson(req); const name=String(b.name||'').trim() || 'Untitled webhook';
       const token=randomToken(24); const created=now(); const r=statements.insertWebhook.run(u.id,name,token,created); const id=r.lastInsertRowid;
       const actions=Array.isArray(b.actions)?b.actions:[];
-      actions.forEach((a,i)=>{ if(!['pre','post'].includes(a.phase)||!a.code) return; statements.insertAction.run(id,a.phase,String(a.name||`Action ${i+1}`),String(a.code),i, a.enabled===false?0:1); });
+      actions.forEach((a,i)=>{ if(!a.code) return; statements.insertAction.run(id,'pre',String(a.name||`Pre-action ${i+1}`),String(a.code),i, a.enabled===false?0:1); });
       const w=statements.webhookById.get(id,u.id); return json(res,201,{webhook:sanitizeWebhook(w),actions:statements.actionsForWebhook.all(id)});
     } catch(e){ return json(res,e.status||500,{error:e.message}); }
   }

@@ -143,10 +143,11 @@ function normalizeActions(input) {
   if (!Array.isArray(input)) return null; // null = not provided, leave unchanged
   const out = [];
   for (const item of input) {
-    if (!item || !["pre", "post"].includes(item.phase) || !item.code) continue;
+    // Only pre-actions are supported (post phase removed).
+    if (!item || !item.code) continue;
     out.push({
-      phase: item.phase,
-      name: String(item.name || `Action ${out.length + 1}`).slice(0, 100),
+      phase: "pre",
+      name: String(item.name || `Pre-action ${out.length + 1}`).slice(0, 100),
       code: String(item.code).slice(0, 20000),
       enabled: item.enabled === false ? 0 : 1,
     });
@@ -219,6 +220,7 @@ async function ensureSubscriptionColumns(env) {
     const ecols = await env.DB.prepare("PRAGMA table_info(events)").all();
     const enames = new Set((ecols.results || []).map((c) => c.name));
     if (!enames.has("query_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN query_json TEXT").run();
+    if (!enames.has("pre_json")) await env.DB.prepare("ALTER TABLE events ADD COLUMN pre_json TEXT").run();
   } catch { /* ignore */ }
 }
 
@@ -252,7 +254,7 @@ function subscriptionView(s) {
 }
 
 async function webhookRelations(env, wid) {
-  const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? ORDER BY phase,sort_order,id").bind(wid).all();
+  const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? AND phase='pre' ORDER BY sort_order,id").bind(wid).all();
   let subscriptions;
   try {
     subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,http_method,headers_json,payload_mode,payload_template,
@@ -315,7 +317,7 @@ async function sampleContextForWebhook(env, wid) {
     eventRow = await env.DB.prepare("SELECT id,webhook_id,method,headers_json,payload_json,raw_body,ip,received_at FROM events WHERE webhook_id=? ORDER BY id DESC LIMIT 1").bind(wid).first();
   }
   if (!eventRow) {
-    const empty = buildContext(null, webhook);
+    const empty = buildContext(null, webhook, [{ enriched: true, userId: 123 }]);
     // Seed with a representative body so the variable picker is useful pre-traffic.
     empty.body = { event: "user.created", user: { id: 123, email: "jane@example.com" } };
     empty.headers = { "content-type": "application/json", "x-api-key": "… " };
@@ -513,7 +515,9 @@ export default {
             WHERE d.event_id=? ORDER BY d.id`).bind(event.id).all();
           let query = {};
           try { query = JSON.parse(event.query_json || "{}"); } catch { query = {}; }
-          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), query, payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
+          let pre = [];
+          try { pre = event.pre_json ? JSON.parse(event.pre_json) : []; if (!Array.isArray(pre)) pre = []; } catch { pre = []; }
+          return apiJson(user, env, ttlMs, { event: { ...event, headers: JSON.parse(event.headers_json || "{}"), query, pre, payload: event.payload_json ? JSON.parse(event.payload_json) : event.raw_body }, deliveries: deliveries.results });
         }
 
         const contextMatch = p.match(/^\/api\/webhooks\/(\d+)\/context$/);
