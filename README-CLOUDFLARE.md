@@ -29,7 +29,7 @@ Then put the returned D1 database ID into `wrangler.jsonc` if Wrangler has not d
 ## 3. Initialize the remote database
 
 ```bash
-npx wrangler d1 execute hooklane-db --remote --file=./schema.sql
+npx wrangler d1 execute hooklane-db --remote --file=./db/schema.sql
 ```
 
 ## 4. Set the production secret

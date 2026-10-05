@@ -2,7 +2,7 @@
 -- Event status is observed via structured worker logs (observability),
 -- counts are maintained async by the analytics queue consumer.
 -- Apply with:
---   npx wrangler d1 execute hooklane-db --remote --file=./migrate-analytics-counters.sql
+--   npx wrangler d1 execute hooklane-db --remote --file=./db/migrate-analytics-counters.sql
 
 -- Per-webhook lifetime totals. Single UPSERT per (webhook, day, field) batch.
 CREATE TABLE IF NOT EXISTS webhook_counters (

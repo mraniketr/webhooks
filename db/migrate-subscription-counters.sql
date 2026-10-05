@@ -3,7 +3,7 @@
 -- in webhook_counters. Delivery outcomes now accumulate per subscription.
 -- received/processed stay webhook-level (ingest + pre-action fan-out).
 -- Apply with:
---   npx wrangler d1 execute hooklane-db --remote --file=./migrate-subscription-counters.sql
+--   npx wrangler d1 execute hooklane-db --remote --file=./db/migrate-subscription-counters.sql
 
 CREATE TABLE IF NOT EXISTS subscription_counters (
   subscription_id INTEGER PRIMARY KEY,

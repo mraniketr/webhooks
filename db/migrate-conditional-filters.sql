@@ -3,9 +3,9 @@
 -- subscription-level filter skips only that subscription when falsy.
 -- Empty/NULL = allow everything (default).
 -- Safe to run multiple times. Apply with:
---   npx wrangler d1 execute hooklane-db --remote --file=./migrate-conditional-filters.sql
+--   npx wrangler d1 execute hooklane-db --remote --file=./db/migrate-conditional-filters.sql
 -- (The Worker also auto-adds these columns on first write via PRAGMA check,
--- so fresh `schema.sql` installs need no migration.)
+-- so fresh `db/schema.sql` installs need no migration.)
 
 ALTER TABLE webhooks ADD COLUMN filter_code TEXT;
 ALTER TABLE subscriptions ADD COLUMN filter_code TEXT;

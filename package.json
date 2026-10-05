@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "deploy:consumer": "wrangler deploy --config wrangler.consumer.jsonc",
     "deploy:all": "wrangler deploy && wrangler deploy --config wrangler.consumer.jsonc",
-    "db:init": "wrangler d1 execute hooklane-db --remote --file=./schema.sql"
+    "db:init": "wrangler d1 execute hooklane-db --remote --file=./db/schema.sql"
   },
   "devDependencies": {
     "wrangler": "latest"

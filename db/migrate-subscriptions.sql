@@ -1,6 +1,6 @@
 -- Migration: add URL subscriptions + per-event delivery log.
 -- Safe to run multiple times (IF NOT EXISTS). Apply with:
---   npx wrangler d1 execute hooklane-db --remote --file=./migrate-subscriptions.sql
+--   npx wrangler d1 execute hooklane-db --remote --file=./db/migrate-subscriptions.sql
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
