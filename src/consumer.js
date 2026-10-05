@@ -44,7 +44,9 @@ export default {
     }
 
     const handler = batch.queue === "hooklane-deliveries" ? processDelivery : processEvent;
-    for (const message of batch.messages) {
+    // Run messages in a batch concurrently — sequential awaits would stack
+    // per-message latency (notably the outbound fetch in processDelivery).
+    await Promise.all(batch.messages.map(async (message) => {
       try {
         await handler(message.body, env, ctx);
         message.ack();
@@ -60,6 +62,6 @@ export default {
         );
         message.retry();
       }
-    }
+    }));
   },
 };
