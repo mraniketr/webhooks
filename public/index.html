@@ -60,10 +60,22 @@
         <div class="field"><label>Status</label><select id="webhookStatus"><option value="active">active</option><option value="disabled">disabled</option></select></div>
         <div class="subhead"><span>Pre-action <small class="muted">JS script — set <code>pre = {...}</code> to expose <code>{{ pre.key }}</code> to subscriptions</small></span><button type="button" class="ghost sm" id="preEditBtn">Edit pre-action</button></div>
         <div id="preSummary"></div>
+        <div class="subhead"><span>Webhook filter <small class="muted">boolean expression — falsy drops the whole event (empty = allow all)</small></span><button type="button" class="ghost sm" id="filterEditBtn">Edit filter</button></div>
+        <div id="filterSummary"></div>
         <div class="subhead"><span>Subscriptions <small class="muted">templated forwards — {{ body }}, {{ headers }}, {{ query }}, {{ pre }} vars in URL, headers &amp; JSON</small></span><button type="button" class="ghost sm" id="addSubBtn">+ Add subscription</button></div>
         <div id="subList"></div>
         <div class="callout"><b>Pipeline:</b> the event travels in the queue (nothing stored per event), the pre-action runs (it sets a key-value <code>pre</code> object), then the payload plus <code>pre</code> is forwarded to each enabled subscription. Use <code>{{ pre.key }}</code> in subscription URL, headers &amp; JSON. Status is in worker logs; analytics are aggregate counts.</div>
         <div class="modal-actions"><button type="button" class="ghost" id="cancelEdit">Cancel</button><button class="primary" type="submit" id="webhookSubmit">Create webhook</button></div>
+      </form></div>
+    </section>
+    <section id="page-filteredit" class="page hidden">
+      <div class="panel"><div class="panel-head"><div><div class="eyebrow">WEBHOOK FILTER</div><h3>Edit webhook filter</h3><p>One boolean expression per webhook. Falsy drops the whole event. Empty allows everything.</p></div><button class="ghost" id="backToEditFromFilter">← Back</button></div>
+      <form id="filterEditForm">
+        <div class="field"><label>Filter expression <small class="muted">e.g. <code>body.plan == "pro" &amp;&amp; headers.x-env == "prod"</code></small></label><textarea id="filterCode" class="tpl-field code" rows="6" placeholder='body.plan == "pro"'></textarea></div>
+        <div class="hint">Comparisons (<code>== != === !== &gt; &gt;= &lt; &lt;=</code>), <code>&amp;&amp;</code>, <code>||</code>, <code>!</code>, arithmetic <code>+ - * / %</code>, parens, refs like <code>body.x</code>, <code>headers.x</code>, <code>query.x</code>, <code>event.payload.x</code>, <code>pre.key</code>, <code>method</code>, <code>ip</code>, plus <code>.includes()</code> / <code>.startsWith()</code> / <code>.endsWith()</code>. Leave empty to allow all events.</div>
+        <div class="sub-tools"><button type="button" class="ghost sm" id="filterTestBtn">Test against sample</button></div>
+        <div class="preview-box hidden" id="filterTestBox"></div>
+        <div class="modal-actions"><button type="button" class="ghost" id="cancelFilterEdit">Cancel</button><button class="primary" type="submit" id="filterSaveBtn">Save filter</button></div>
       </form></div>
     </section>
     <section id="page-preedit" class="page hidden">
@@ -95,6 +107,8 @@
   "plan": "{{ body.plan || &quot;free&quot; }}"
 }'></textarea></div>
         <div class="hint">Custom JSON body with variables. Choose <b>passthrough</b> to forward the event body unchanged.</div></div>
+        <div class="field"><label>Subscription filter <small class="muted">boolean expression — falsy skips only this subscription (empty = allow all)</small></label><textarea id="subFilterCode" class="tpl-field code" rows="3" placeholder='body.plan == "pro"'></textarea></div>
+        <div class="hint">Same expression language as the webhook filter. Runs after the pre-action, so <code>pre.key</code> is available.</div>
         <div class="sub-tools"><button type="button" class="ghost sm" id="subVarsBtn">Variables</button><button type="button" class="ghost sm" id="subPreviewBtn">Preview render</button></div>
         <div class="var-panel hidden" id="subVarPanel"></div>
         <div class="preview-box hidden" id="subPreviewBox"></div>
