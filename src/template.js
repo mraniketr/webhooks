@@ -621,8 +621,368 @@ function renderSubscription(sub, ctx) {
   return { url, method: finalMethod, headers, bodyText, errors };
 }
 
+// ---------------------------------------------------------------------------
+// Conditional filter evaluation (issue #7).
+//
+// Webhook-level filter: when set, a falsy result drops the whole event.
+// Subscription-level filter: when set, a falsy result skips only that
+// subscription. Empty/unset code allows everything (fail open).
+//
+// The filter is a single boolean *expression* evaluated safely — no
+// eval/new Function (blocked on Workers Free plan), no function calls
+// except a small whitelist of pure methods. Same context as templates:
+//   body, payload (alias), headers, query, event, webhook, pre, method, ip
+//
+// Examples:
+//   body.plan == "pro"
+//   body.amount > 100 && headers.x-env == "prod"
+//   pre.vip == true || query.debug == "1"
+//   body.tags.includes("vip")
+//   !(body.type == "test")
+//
+// Returns { allow, error, value }. On parse/eval error we fail OPEN
+// (allow=true) with error set, so a typo never silently drops traffic —
+// callers log `error` as filterError.
+// ---------------------------------------------------------------------------
+
+function lookupFilterRef(root, rest, ctx) {
+  if (root === "payload") return getPath(ctx.body ?? {}, rest);
+  if (root === "body" || root === "headers" || root === "query" || root === "event" || root === "webhook" || root === "pre") {
+    return getPath(ctx[root] ?? {}, rest);
+  }
+  if (root === "method" || root === "ip") {
+    return rest.length === 0 ? ctx[root] : undefined;
+  }
+  return undefined;
+}
+
+const FILTER_ROOTS = new Set(["body", "payload", "headers", "query", "event", "webhook", "pre", "method", "ip"]);
+const FILTER_METHODS = new Set(["includes", "startsWith", "endsWith"]);
+
+function tokenizeFilter(s) {
+  const tokens = [];
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    // strings
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      let out = "";
+      while (j < n) {
+        const ch = s[j];
+        if (ch === "\\" && j + 1 < n) {
+          const e = s[j + 1];
+          out += e === "n" ? "\n" : e === "r" ? "\r" : e === "t" ? "\t" : e;
+          j += 2;
+          continue;
+        }
+        if (ch === c) { j++; break; }
+        out += ch;
+        j++;
+      }
+      tokens.push({ t: "str", v: out });
+      i = j;
+      continue;
+    }
+    // numbers
+    const numM = s.slice(i).match(/^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/);
+    // Only treat leading - as part of number when it looks like a negative literal;
+    // binary minus is handled as an operator below. To keep it simple, only
+    // consume digits here (unary minus is parsed in parseUnary).
+    const numM2 = s.slice(i).match(/^(\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/);
+    if (numM2 && /[0-9.]/.test(c)) {
+      tokens.push({ t: "num", v: Number(numM2[0]) });
+      i += numM2[0].length;
+      continue;
+    } else if (numM && c === "-" && /[0-9.]/.test(s[i + 1] || "")) {
+      void numM;
+    }
+    // multi-char operators
+    const three = s.slice(i, i + 3);
+    if (three === "===" || three === "!==") { tokens.push({ t: "op", v: three }); i += 3; continue; }
+    const two = s.slice(i, i + 2);
+    if (two === "==" || two === "!=" || two === ">=" || two === "<=" || two === "&&" || two === "||") {
+      tokens.push({ t: "op", v: two }); i += 2; continue;
+    }
+    if ("!><+-*/%(),.[]".includes(c)) { tokens.push({ t: "op", v: c }); i++; continue; }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i;
+      while (j < n && /[A-Za-z0-9_$]/.test(s[j])) j++;
+      const word = s.slice(i, j);
+      // header names after a dot may contain hyphens — consumed by the
+      // member-access parser, not here.
+      tokens.push({ t: "id", v: word });
+      i = j;
+      continue;
+    }
+    return { error: `Unexpected character "${c}" in filter expression.` };
+  }
+  return { tokens };
+}
+
+function evaluateFilter(code, ctx) {
+  const raw = String(code ?? "");
+  if (!raw.trim()) return { allow: true, error: null, value: true, empty: true };
+  let text = stripJsComments(raw).trim();
+  if (!text) return { allow: true, error: null, value: true, empty: true };
+  // Allow `return <expr>;` / `return(<expr>)` style, like a JS function body.
+  const retM = text.match(/^\s*return\b([\s\S]*)$/);
+  if (retM) {
+    text = retM[1].trim();
+    if (text.startsWith(";")) text = text.slice(1).trim();
+  }
+  // Trailing semicolon is noise.
+  text = text.replace(/;+\s*$/, "").trim();
+  if (!text) return { allow: true, error: null, value: true, empty: true };
+  if (/\bpre\s*=\s*\{/.test(text) && !/==|!=|>=|<=/.test(text)) {
+    return { allow: true, error: "Filter must be a boolean expression (e.g. body.plan == \"pro\"), not a `pre = {...}` assignment.", value: null };
+  }
+  if (/\b(function|=>|for|while|fetch|eval|Function|import|require|process|globalThis|constructor|prototype|__proto__)\b/.test(text)) {
+    return { allow: true, error: "Only plain comparisons, &&, ||, ! and references like body.x / headers.x / pre.key are supported in filters.", value: null };
+  }
+  const tok = tokenizeFilter(text);
+  if (tok.error) return { allow: true, error: tok.error, value: null };
+  const tokens = tok.tokens;
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++];
+  const expect = (v) => {
+    const t = peek();
+    if (!t || t.v !== v) throw new Error(`Expected "${v}" in filter expression.`);
+    return next();
+  };
+
+  function parseExpr() { return parseOr(); }
+  function parseOr() {
+    let l = parseAnd();
+    while (peek() && peek().t === "op" && peek().v === "||") { next(); const r = parseAnd(); l = l || r; }
+    return l;
+  }
+  function parseAnd() {
+    let l = parseEquality();
+    while (peek() && peek().t === "op" && peek().v === "&&") { next(); const r = parseEquality(); l = l && r; }
+    return l;
+  }
+  function parseEquality() {
+    let l = parseRel();
+    for (;;) {
+      const t = peek();
+      if (!t || t.t !== "op" || !["==", "!=", "===", "!=="].includes(t.v)) break;
+      const op = next().v;
+      const r = parseRel();
+      if (op === "==") l = l == r; // eslint-disable-line eqeqeq
+      else if (op === "!=") l = l != r; // eslint-disable-line eqeqeq
+      else if (op === "===") l = l === r;
+      else l = l !== r;
+    }
+    return l;
+  }
+  function parseRel() {
+    let l = parseAdd();
+    for (;;) {
+      const t = peek();
+      if (!t || t.t !== "op" || ![">", ">=", "<", "<="].includes(t.v)) break;
+      const op = next().v;
+      const r = parseAdd();
+      try {
+        if (op === ">") l = l > r;
+        else if (op === ">=") l = l >= r;
+        else if (op === "<") l = l < r;
+        else l = l <= r;
+      } catch { l = false; }
+    }
+    return l;
+  }
+  function parseAdd() {
+    let l = parseMul();
+    for (;;) {
+      const t = peek();
+      if (!t || t.t !== "op" || (t.v !== "+" && t.v !== "-")) break;
+      const op = next().v;
+      const r = parseMul();
+      try { l = op === "+" ? addVals(l, r) : subVals(l, r); }
+      catch { l = NaN; }
+    }
+    return l;
+  }
+  function parseMul() {
+    let l = parseUnary();
+    for (;;) {
+      const t = peek();
+      if (!t || t.t !== "op" || (t.v !== "*" && t.v !== "/" && t.v !== "%")) break;
+      const op = next().v;
+      const r = parseUnary();
+      const a = Number(l);
+      const b = Number(r);
+      if (op === "*") l = a * b;
+      else if (op === "/") l = b === 0 ? NaN : a / b;
+      else l = b === 0 ? NaN : a % b;
+    }
+    return l;
+  }
+  function parseUnary() {
+    const t = peek();
+    if (t && t.t === "op" && t.v === "!") { next(); return !parseUnary(); }
+    if (t && t.t === "op" && t.v === "-") { next(); const v = parseUnary(); const n = Number(v); return Number.isNaN(n) ? NaN : -n; }
+    return parsePrimary();
+  }
+  function parsePrimary() {
+    const t = peek();
+    if (!t) throw new Error("Unexpected end of filter expression.");
+    if (t.t === "op" && t.v === "(") {
+      next();
+      const v = parseExpr();
+      expect(")");
+      return applyTrailer(v);
+    }
+    if (t.t === "str") { next(); return applyTrailer(t.v); }
+    if (t.t === "num") { next(); return applyTrailer(t.v); }
+    if (t.t === "id") {
+      const w = t.v;
+      if (w === "true") { next(); return applyTrailer(true); }
+      if (w === "false") { next(); return applyTrailer(false); }
+      if (w === "null") { next(); return applyTrailer(null); }
+      if (w === "undefined") { next(); return applyTrailer(undefined); }
+      if (!FILTER_ROOTS.has(w)) {
+        throw new Error(`Unknown reference "${w}" — use body.x, headers.x, query.x, event.payload.x, pre.key, method or ip.`);
+      }
+      next();
+      // dotted / bracket path after the root
+      const segs = [];
+      let cur = lookupFilterRef(w, [], ctx);
+      // If root alone (method/ip/scalars), trailers still apply.
+      for (;;) {
+        const d = peek();
+        if (d && d.t === "op" && d.v === ".") {
+          // Leave whitelisted method calls (`.includes(` etc.) for
+          // applyTrailer — it executes them safely on the resolved value.
+          const pAhead = tokens[pos + 1];
+          const pAhead2 = tokens[pos + 2];
+          if (pAhead && pAhead.t === "id" && FILTER_METHODS.has(pAhead.v) && pAhead2 && pAhead2.t === "op" && pAhead2.v === "(") break;
+          next();
+          const p = peek();
+          if (!p || (p.t !== "id" && p.t !== "str" && p.t !== "num")) throw new Error("Expected a property name after \".\" in filter expression.");
+          // Header names may contain hyphens: consume `-name` continuations.
+          let name = String(next().v);
+          while (peek() && peek().t === "op" && peek().v === "-") {
+            next();
+            const q = peek();
+            if (!q || (q.t !== "id" && q.t !== "num")) throw new Error("Expected a property name after \"-\" in filter expression.");
+            name += "-" + String(next().v);
+          }
+          segs.push(name);
+          cur = resolveSegs(w, segs, ctx);
+          continue;
+        }
+        if (d && d.t === "op" && d.v === "[") {
+          next();
+          const k = peek();
+          if (!k || (k.t !== "str" && k.t !== "num" && k.t !== "id")) throw new Error("Only string/number keys are supported in [...] in filters.");
+          let key;
+          if (k.t === "str" || k.t === "num") { key = next().v; }
+          else {
+            const qw = next().v;
+            if (qw === "true" || qw === "false" || qw === "null" || qw === "undefined") throw new Error("Only string/number keys are supported in [...] in filters.");
+            key = qw;
+          }
+          expect("]");
+          segs.push(String(key));
+          cur = resolveSegs(w, segs, ctx);
+          continue;
+        }
+        break;
+      }
+      return applyTrailer(cur);
+    }
+    throw new Error(`Unexpected "${t.v}" in filter expression — use comparisons, &&, ||, ! and references like body.x.`);
+  }
+  function resolveSegs(root, segs, c) {
+    if (!segs.length) return lookupFilterRef(root, [], c);
+    return lookupFilterRef(root, segs, c);
+  }
+  function applyTrailer(val) {
+    for (;;) {
+      const d = peek();
+      if (d && d.t === "op" && d.v === ".") {
+        const save = pos;
+        next();
+        const p = peek();
+        if (!p || p.t !== "id") { pos = save; break; }
+        const name = next().v;
+        const open = peek();
+        if (open && open.t === "op" && open.v === "(") {
+          // method call: only whitelist on string/array receivers
+          if (!FILTER_METHODS.has(name)) {
+            throw new Error(`Function calls like ${name}(...) are not supported in filters — try .includes(), .startsWith() or .endsWith().`);
+          }
+          next(); // (
+          const args = [];
+          if (!(peek() && peek().t === "op" && peek().v === ")")) {
+            args.push(parseExpr());
+            while (peek() && peek().t === "op" && peek().v === ",") { next(); args.push(parseExpr()); }
+          }
+          expect(")");
+          val = callMethod(val, name, args);
+          continue;
+        }
+        // property access: length or nested key
+        if (val == null) { val = undefined; continue; }
+        if (name === "length" && (typeof val === "string" || Array.isArray(val))) { val = val.length; continue; }
+        // generic key with case-insensitive fallback for objects
+        if (typeof val === "object") {
+          if (name in val) val = val[name];
+          else {
+            const key = Object.keys(val).find((k) => k.toLowerCase() === String(name).toLowerCase());
+            val = key === undefined ? undefined : val[key];
+          }
+        } else {
+          val = undefined;
+        }
+        continue;
+      }
+      break;
+    }
+    return val;
+  }
+  function addVals(a, b) {
+    if (typeof a === "string" || typeof b === "string") return String(a ?? "") + String(b ?? "");
+    return Number(a) + Number(b);
+  }
+  function subVals(a, b) { return Number(a) - Number(b); }
+  function callMethod(recv, name, args) {
+    const arg = args[0];
+    try {
+      if (typeof recv === "string") {
+        const s = String(arg ?? "");
+        if (name === "includes") return recv.includes(s);
+        if (name === "startsWith") return recv.startsWith(s);
+        if (name === "endsWith") return recv.endsWith(s);
+      }
+      if (Array.isArray(recv)) {
+        if (name === "includes") return recv.some((x) => x == arg); // eslint-disable-line eqeqeq
+        if (name === "startsWith" || name === "endsWith") return false;
+      }
+    } catch { return false; }
+    return false;
+  }
+
+  try {
+    const value = parseExpr();
+    if (pos < tokens.length) {
+      const rest = tokens[pos]?.v;
+      throw new Error(`Unexpected "${rest}" in filter expression — use comparisons, &&, ||, ! and references like body.x.`);
+    }
+    return { allow: Boolean(value), error: null, value };
+  } catch (e) {
+    return { allow: true, error: e?.message || "Invalid filter expression.", value: null };
+  }
+}
+
 export {
   buildContext,
+  evaluateFilter,
   evaluatePreAssignment,
   extractPlaceholders,
   flattenPaths,

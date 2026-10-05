@@ -1,4 +1,4 @@
-import { buildContext, evaluatePreAssignment, renderSubscription } from "./template.js";
+import { buildContext, evaluateFilter, evaluatePreAssignment, renderSubscription } from "./template.js";
 import { getRouteConfig, getSubscription, getWebhookRow, invalidateRouteConfig } from "./cache.js";
 
 function now() {
@@ -85,25 +85,29 @@ async function processEvent(message, env, ctx) {
 
   let route = await getRouteConfig(env, ctx, webhookId, async () => {
     const [webhookRow, actions, subs] = await Promise.all([
-      env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null),
+      env.DB.prepare("SELECT id,name,filter_code FROM webhooks WHERE id=?").bind(webhookId).first()
+        .catch(() => env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null)),
       env.DB.prepare(
         "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
       ).bind(webhookId).all().catch(() => ({ results: [] })),
       env.DB.prepare(
-        "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
-      ).bind(webhookId).all().catch(() => ({ results: [] })),
+        "SELECT id,filter_code FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
+      ).bind(webhookId).all().catch(() =>
+        env.DB.prepare("SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id").bind(webhookId).all().catch(() => ({ results: [] }))),
     ]);
+    const subRows = (subs?.results || []).map((s) => ({ id: Number(s.id), filter_code: s.filter_code ?? null })).filter((s) => Boolean(s.id));
     return {
       webhookRow: webhookRow || null,
       actions: actions?.results || [],
-      subIds: (subs?.results || []).map((s) => Number(s.id)).filter(Boolean),
+      subIds: subRows.map((s) => s.id),
+      subs: subRows,
     };
   }).catch(() => null);
 
   // Stale-empty guard: a cached "no subscriptions" entry must never drop a
   // fan-out right after a subscription was added. Re-check D1 once and
   // refresh the cache when the fresh list is non-empty.
-  if (route && (route.subIds || []).length === 0) {
+  if (route && (route.subIds || []).length === 0 && !(route.subs || []).length) {
     try {
       const fresh = await env.DB.prepare(
         "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
@@ -111,7 +115,7 @@ async function processEvent(message, env, ctx) {
       const freshIds = (fresh?.results || []).map((s) => Number(s.id)).filter(Boolean);
       if (freshIds.length > 0) {
         invalidateRouteConfig(env, ctx, webhookId);
-        route = { ...route, subIds: freshIds };
+        route = { ...route, subIds: freshIds, subs: freshIds.map((id) => ({ id, filter_code: null })) };
       }
     } catch { /* keep cached route */ }
   }
@@ -129,7 +133,52 @@ async function processEvent(message, env, ctx) {
     preError = r.error;
   }
 
-  const targets = route?.subIds || [];
+  // Webhook-level conditional filter: falsy drops the whole event.
+  // Empty/unset allows everything; errors fail open (allow) with a log.
+  const filterCtx = buildContext(rowFromMessage(msg, pre), webhookRow, pre);
+  let webhookFilterError = null;
+  const webhookFilterCode = webhookRow?.filter_code ?? null;
+  if (webhookFilterCode && String(webhookFilterCode).trim()) {
+    const fr = evaluateFilter(webhookFilterCode, filterCtx);
+    if (fr.error) webhookFilterError = fr.error;
+    if (!fr.allow && !fr.error) {
+      logEventStatus({
+        msg: "event filtered", status: "filtered",
+        eventId, webhookId, deliveriesEnqueued: 0, filtered: true,
+        ...(preError ? { preError } : {}),
+      });
+      return;
+    }
+    // On filter error we fail open (deliver anyway) but surface the error.
+    if (!fr.allow && fr.error) webhookFilterError = fr.error;
+  }
+
+  // Subscription-level filters: falsy skips only that subscription.
+  // Cached rows carry filter_code; unknown/legacy shapes fail open.
+  const cachedSubs = Array.isArray(route?.subs) && route.subs.length
+    ? route.subs
+    : (route?.subIds || []).map((id) => ({ id: Number(id), filter_code: null }));
+  const targets = [];
+  let filteredSubs = 0;
+  for (const s of cachedSubs) {
+    const sid = Number(s?.id);
+    if (!sid) continue;
+    const fc = s?.filter_code ?? null;
+    if (fc && String(fc).trim()) {
+      const fr = evaluateFilter(fc, filterCtx);
+      if (fr.error) {
+        // Fail open per subscription; surface via log below.
+        webhookFilterError = webhookFilterError || fr.error;
+        targets.push(sid);
+      } else if (fr.allow) {
+        targets.push(sid);
+      } else {
+        filteredSubs++;
+      }
+    } else {
+      targets.push(sid);
+    }
+  }
 
   // Fan-out concurrently: per-subscription latency never stacks, and the
   // analytics increment rides along with its own delivery send.
@@ -165,12 +214,14 @@ async function processEvent(message, env, ctx) {
   }
 
   logEventStatus({
-    msg: "event processed",
-    status: "processed",
+    msg: filteredSubs > 0 ? "event processed (some subscriptions filtered)" : "event processed",
+    status: filteredSubs > 0 && targets.length === 0 ? "filtered" : "processed",
     eventId,
     webhookId,
     deliveriesEnqueued: targets.length,
+    ...(filteredSubs ? { filteredSubs } : {}),
     ...(preError ? { preError } : {}),
+    ...(webhookFilterError ? { filterError: webhookFilterError } : {}),
   });
 }
 
@@ -191,7 +242,8 @@ async function processDelivery(message, env, ctx) {
       env.DB.prepare("SELECT * FROM subscriptions WHERE id=?").bind(subscriptionId).first().catch(() => null)
     ).catch(() => null),
     getWebhookRow(env, ctx, webhookId, async () =>
-      env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null)
+      env.DB.prepare("SELECT id,name,filter_code FROM webhooks WHERE id=?").bind(webhookId).first()
+        .catch(() => env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null))
     ).catch(() => null),
   ]);
   // Stale-disabled guard: a cached disabled/missing row must never drop a
@@ -216,6 +268,36 @@ async function processDelivery(message, env, ctx) {
     webhookRow,
     msg.pre || {}
   );
+  // Defense-in-depth: re-evaluate filters here in case the fan-out used a
+  // stale route cache from before a filter was added. Filter errors fail
+  // open (deliver anyway).
+  const webhookFc = webhookRow?.filter_code ?? null;
+  if (webhookFc && String(webhookFc).trim()) {
+    const fr = evaluateFilter(webhookFc, tplCtx);
+    if (!fr.error && !fr.allow) {
+      logEventStatus({
+        msg: "delivery filtered", status: "filtered",
+        eventId, webhookId, subscriptionId, reason: "webhook filter",
+      });
+      return;
+    }
+  }
+  const subFc = sub?.filter_code ?? null;
+  if (subFc && String(subFc).trim()) {
+    const fr = evaluateFilter(subFc, tplCtx);
+    if (fr.error) {
+      logEventStatus({
+        msg: "delivery filter error (fail open)", status: "success",
+        eventId, webhookId, subscriptionId, filterError: fr.error,
+      });
+    } else if (!fr.allow) {
+      logEventStatus({
+        msg: "delivery filtered", status: "filtered",
+        eventId, webhookId, subscriptionId, reason: "subscription filter",
+      });
+      return;
+    }
+  }
   const rendered = renderSubscription(sub, tplCtx);
 
   if (!rendered.url) {

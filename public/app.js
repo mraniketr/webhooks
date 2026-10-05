@@ -3,6 +3,7 @@ const $$ = s => [...document.querySelectorAll(s)];
 let currentPage = 'dashboard', currentWebhook = null, user = null;
 let editingId = null;
 let editingPre = null;
+let editingFilter = '';
 let editingSubs = [];
 let editingSubIndex = null; // null | number ('new' uses -1)
 let varCache = { wid: null, variables: null, hasSample: false };
@@ -35,7 +36,7 @@ function showPage(page) {
   currentPage = page;
   $$('.page').forEach(x => x.classList.add('hidden'));
   $(`#page-${page}`).classList.remove('hidden');
-  const navFor = ['detail', 'edit', 'subedit', 'preedit', 'subscription'].includes(page) ? 'webhooks' : page;
+  const navFor = ['detail', 'edit', 'subedit', 'preedit', 'filteredit', 'subscription'].includes(page) ? 'webhooks' : page;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === navFor));
   const titles = {
     dashboard: ['Overview', 'Webhook health at a glance'],
@@ -45,6 +46,7 @@ function showPage(page) {
     edit: ['All Webhooks', 'Create or edit endpoint'],
     subedit: ['All Webhooks', 'Edit one subscription'],
     preedit: ['All Webhooks', 'Edit pre-action'],
+    filteredit: ['All Webhooks', 'Edit webhook filter'],
   };
   const [eyebrow, title] = titles[page] || titles.webhooks;
   $('#pageEyebrow').textContent = eyebrow;
@@ -104,6 +106,7 @@ function normalizeSubForEditor(s = {}) {
     headers: headers || {},
     payload_mode: s.payload_mode || 'passthrough',
     payload_template: s.payload_template || '',
+    filter_code: s.filter_code || '',
     stats: {
       enqueued: Number(stats.enqueued ?? s.enqueued ?? 0),
       delivered_ok: Number(stats.delivered_ok ?? s.delivered_ok ?? 0),
@@ -114,12 +117,13 @@ function normalizeSubForEditor(s = {}) {
 }
 function openCreate() {
   editingId = null; varCache = { wid: null, variables: null, hasSample: false };
-  editingPre = normalizePreForEditor({}); editingSubs = []; editingSubIndex = null;
+  editingPre = normalizePreForEditor({}); editingFilter = ''; editingSubs = []; editingSubIndex = null;
   $('#editEyebrow').textContent = 'NEW ENDPOINT';
   $('#editTitle').textContent = 'Create webhook';
   $('#webhookSubmit').textContent = 'Create webhook';
   $('#webhookName').value = ''; $('#webhookStatus').value = 'active';
   renderPreSummary();
+  renderFilterSummary();
   renderSubList();
   showPage('edit');
 }
@@ -135,6 +139,8 @@ async function openEdit(id) {
     $('#webhookStatus').value = d.webhook.status || 'active';
     editingPre = normalizePreForEditor(d.actions[0] || {});
     renderPreSummary();
+    editingFilter = d.webhook?.filter_code || '';
+    renderFilterSummary();
     editingSubs = (d.subscriptions || []).map(normalizeSubForEditor);
     renderSubList();
     showPage('edit');
@@ -173,6 +179,37 @@ function openPreEditor() {
   $('#preEnabled').value = String(p.enabled ?? 1);
   $('#preCode').value = p.code || '';
   showPage('preedit');
+}
+
+function renderFilterSummary() {
+  const box = $('#filterSummary');
+  if (!box) return;
+  const code = (editingFilter || '').trim();
+  if (!code) {
+    box.innerHTML = '<div class="empty">No filter — all events pass. Edit to add a boolean expression.</div>';
+    return;
+  }
+  const preview = String(editingFilter).slice(0, 220);
+  box.innerHTML = '';
+  const row = document.createElement('div');
+  row.className = 'hook-row sub-list-row';
+  row.innerHTML = `<div><strong>Webhook filter</strong>`
+    + `<small class="mono">${esc(preview)}${String(editingFilter).length > 220 ? '…' : ''}</small>`
+    + `<small>falsy drops the whole event · empty allows all</small></div>`
+    + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
+  row.querySelector('button').onclick = () => openFilterEditor();
+  box.append(row);
+}
+
+function openFilterEditor() {
+  $('#filterCode').value = editingFilter || '';
+  const tb = $('#filterTestBox');
+  if (tb) { tb.classList.add('hidden'); tb.innerHTML = ''; }
+  showPage('filteredit');
+}
+
+function closeFilterEditor() {
+  showPage('edit');
 }
 
 function closePreEditor() {
@@ -216,7 +253,7 @@ function renderSubList() {
     row.className = 'hook-row sub-list-row clickable';
     row.innerHTML = `<div><strong>${esc(s.name || s.target_url || 'Untitled subscription')}</strong>`
       + `<small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url || '—')}</small>`
-      + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}</small>`
+      + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}${s.filter_code && String(s.filter_code).trim() ? ' · filtered' : ''}</small>`
       + `<small class="mono">${esc(statBits)} · click for details</small></div>`
       + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
     row.querySelector('button').onclick = (e) => { e.stopPropagation(); openSubEditor(i); };
@@ -248,6 +285,7 @@ function openSubEditor(index) {
   $('#subSecret').value = '';
   $('#subSecretHint').textContent = s.has_secret ? 'has secret — leave blank to keep' : 'optional';
   $('#subPayloadTemplate').value = s.payload_template || '';
+  $('#subFilterCode').value = s.filter_code || '';
   const hb = $('#subHeadersBox');
   hb.innerHTML = '';
   const entries = Object.entries(s.headers || {});
@@ -284,6 +322,7 @@ function collectSubEditor() {
     headers,
     payload_mode: mode,
     payload_template: mode === 'custom' ? $('#subPayloadTemplate').value : '',
+    filter_code: ($('#subFilterCode')?.value || '').slice(0, 20000),
     stats: prev.stats || { enqueued: 0, delivered_ok: 0, delivered_failed: 0, pending: 0 },
   };
 }
@@ -299,6 +338,7 @@ function subToApi(s) {
     headers: s.headers || {},
     payload_mode: s.payload_mode,
     payload_template: s.payload_mode === 'custom' ? (s.payload_template || '') : undefined,
+    filter_code: s.filter_code || '',
   };
 }
 
@@ -371,9 +411,14 @@ async function previewSingleSubscription() {
     return;
   }
   try {
-    const d = await api('/api/webhooks/' + editingId + '/subscriptions/preview', { method: 'POST', body: JSON.stringify({ subscription: subToApi(sub) }) });
+    const d = await api('/api/webhooks/' + editingId + '/subscriptions/preview', { method: 'POST', body: JSON.stringify({ subscription: subToApi(sub), webhook_filter_code: editingFilter || '' }) });
     const r = d.rendered;
+    const wf = d.webhookFilter;
+    const sf = d.subscriptionFilter;
+    const filterBits = `${wf ? `<div class="${wf.allow ? 'preview-ok' : 'preview-err'}">Webhook filter: ${wf.error ? 'error — ' + esc(wf.error) + ' (fail open, allows)' : (wf.allow ? 'ALLOW' : 'DROP event')}</div>` : ''}`
+      + `${sf ? `<div class="${sf.allow ? 'preview-ok' : 'preview-err'}">Subscription filter: ${sf.error ? 'error — ' + esc(sf.error) + ' (fail open, allows)' : (sf.allow ? 'ALLOW' : 'SKIP this subscription')}</div>` : ''}`;
     box.innerHTML = `${d.preError ? `<div class="preview-err">Pre-action: ${esc(d.preError)}</div>` : ''}`
+      + filterBits
       + `${r.errors?.length ? `<div class="preview-err">${r.errors.map(esc).join('<br/>')}</div>` : '<div class="preview-ok">Rendered OK</div>'}`
       + `<div class="preview-grid"><div><span>METHOD</span><code>${esc(r.method)}</code></div><div><span>URL</span><code>${esc(r.url)}</code></div></div>`
       + `${Object.keys(r.headers || {}).length ? `<div><span>HEADERS</span><pre>${esc(JSON.stringify(r.headers, null, 2))}</pre></div>` : '<div class="muted">No custom headers.</div>'}`
@@ -383,21 +428,43 @@ async function previewSingleSubscription() {
 
 async function persistSubscriptionsAfterSubSave() {
   // One-by-one UX with immediate persistence for existing webhooks.
-  // Include current name/status/actions so unsaved edits elsewhere aren't lost.
+  // Include current name/status/actions/filter so unsaved edits elsewhere aren't lost.
   if (!editingId) return null;
   const payload = {
     name: $('#webhookName').value.trim() || undefined,
     status: $('#webhookStatus').value,
+    filter_code: editingFilter || '',
     actions: collectActions(),
     subscriptions: editingSubs.filter(s => s.target_url).map(subToApi),
   };
   return api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(payload) });
 }
 
+async function testWebhookFilter() {
+  const box = $('#filterTestBox');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="muted">Evaluating…</div>';
+  const code = $('#filterCode').value;
+  if (!editingId) {
+    box.innerHTML = '<div class="muted">Save the webhook first to test against its sample event.</div>';
+    return;
+  }
+  try {
+    const d = await api('/api/webhooks/' + editingId + '/filter/preview', { method: 'POST', body: JSON.stringify({ code }) });
+    box.innerHTML = d.error
+      ? `<div class="preview-err">Error: ${esc(d.error)} (fail open — event would be allowed)</div>`
+      : `<div class="${d.allow ? 'preview-ok' : 'preview-err'}">Result: ${d.allow ? 'ALLOW — event passes' : 'DROP — event would be rejected'}</div>`;
+  } catch (err) { box.innerHTML = `<div class="preview-err">${esc(err.message)}</div>`; }
+}
+
 ['#newWebhookBtn', '#newWebhookBtn2'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
 const preEditBtn = $('#preEditBtn'); if (preEditBtn) preEditBtn.onclick = () => openPreEditor();
 const backToEditFromPre = $('#backToEditFromPre'); if (backToEditFromPre) backToEditFromPre.onclick = closePreEditor;
 const cancelPreEdit = $('#cancelPreEdit'); if (cancelPreEdit) cancelPreEdit.onclick = closePreEditor;
+const filterEditBtn = $('#filterEditBtn'); if (filterEditBtn) filterEditBtn.onclick = () => openFilterEditor();
+const backToEditFromFilter = $('#backToEditFromFilter'); if (backToEditFromFilter) backToEditFromFilter.onclick = closeFilterEditor;
+const cancelFilterEdit = $('#cancelFilterEdit'); if (cancelFilterEdit) cancelFilterEdit.onclick = closeFilterEditor;
+const filterTestBtn = $('#filterTestBtn'); if (filterTestBtn) filterTestBtn.onclick = testWebhookFilter;
 $('#addSubBtn').onclick = () => openSubEditor(-1);
 $('#cancelEdit').onclick = cancelEdit;
 $('#backToWebhooks').onclick = cancelEdit;
@@ -412,6 +479,7 @@ $('#subPayloadMode').onchange = syncSubPayloadMode;
 $('#subVarsBtn').onclick = toggleSubVarPanel;
 $('#subPreviewBtn').onclick = previewSingleSubscription;
 ['#subTargetUrl', '#subPayloadTemplate'].forEach(id => { const el = $(id); if (el) el.addEventListener('focus', e => lastTemplateField = e.target); });
+const _subFilterEl = $('#subFilterCode'); if (_subFilterEl) _subFilterEl.addEventListener('focus', e => lastTemplateField = e.target);
 $('#subEditForm').onsubmit = async e => {
   e.preventDefault();
   const draft = collectSubEditor();
@@ -452,9 +520,31 @@ if (preEditForm) preEditForm.onsubmit = async e => {
   renderPreSummary();
   showPage('edit');
 };
+const filterEditForm = $('#filterEditForm');
+if (filterEditForm) filterEditForm.onsubmit = async e => {
+  e.preventDefault();
+  editingFilter = $('#filterCode').value || '';
+  if (editingId) {
+    try {
+      const saved = await api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify({
+        name: $('#webhookName').value.trim() || undefined,
+        status: $('#webhookStatus').value,
+        filter_code: editingFilter,
+        actions: collectActions(),
+        subscriptions: editingSubs.filter(s => s.target_url).map(subToApi),
+      }) });
+      if (saved?.webhook) editingFilter = saved.webhook.filter_code || '';
+      toast(editingFilter && editingFilter.trim() ? 'Filter saved' : 'Filter cleared (allow all)');
+    } catch (err) { toast(err.message, true); return; }
+  } else {
+    toast('Filter updated — save webhook to apply');
+  }
+  renderFilterSummary();
+  showPage('edit');
+};
 $('#webhookForm').onsubmit = async e => {
   e.preventDefault();
-  const body = { name: $('#webhookName').value.trim(), status: $('#webhookStatus').value, actions: collectActions(), subscriptions: editingSubs.filter(s => s.target_url).map(subToApi) };
+  const body = { name: $('#webhookName').value.trim(), status: $('#webhookStatus').value, filter_code: editingFilter || '', actions: collectActions(), subscriptions: editingSubs.filter(s => s.target_url).map(subToApi) };
   try {
     if (editingId) {
       const d = await api('/api/webhooks/' + editingId, { method: 'PUT', body: JSON.stringify(body) });
@@ -494,7 +584,8 @@ async function openWebhook(id) {
     $('#webhookDetail').innerHTML = `<div class="detail-title"><div><div class="url-box"><code>${esc(currentWebhook.url)}</code><button type="button" class="ghost" onclick="copyWebhookUrl()">Copy URL</button></div><div class="curl-box"><div class="curl-head"><span>Test with curl</span><button type="button" class="ghost sm" onclick="copyWebhookCurl()">Copy curl</button></div><pre class="curl-code"><code>${esc(buildCurl(currentWebhook.url))}</code></pre></div></div></div>`
       + `<div class="detail-stats">${[['Queued', d.stats.enqueued || 0], ['Delivered', d.stats.delivered_ok || 0], ['Failed', d.stats.delivered_failed || 0], ['Pending', d.stats.pending || 0]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
       + `<div class="panel-head"><div><h3>Pre-action</h3><p>Sets a key-value <code>pre</code> object — subscriptions use <code>{{ pre.key }}</code>.</p></div><span class="count-pill">${d.actions.length}</span></div><div class="action-list">${d.actions.length ? (() => { const a = d.actions[0]; return `<div class="action-item"><strong>${esc(a.name || 'Pre-action')}</strong><small>${a.enabled ? 'enabled' : 'disabled'}</small><pre>${esc(a.code)}</pre></div>`; })() : '<div class="empty">No pre-action configured.</div>'}</div>`
-      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Click a subscription for its delivery stats. Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => { const st = s.stats || {}; const enq = st.enqueued ?? s.enqueued ?? 0; const ok = st.delivered_ok ?? s.delivered_ok ?? 0; const fail = st.delivered_failed ?? s.delivered_failed ?? 0; return `<div class="action-item clickable" onclick="openSubscription(${s.id})"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}</small><small class="mono">${enq} queued · ${ok} delivered · ${fail} failed — click for details</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div>`; }).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Webhook filter</h3><p>Boolean expression — falsy drops the whole event. Empty allows all.</p></div></div><div class="action-list">${currentWebhook.filter_code && String(currentWebhook.filter_code).trim() ? `<div class="action-item"><strong>Filter active</strong><pre>${esc(currentWebhook.filter_code)}</pre></div>` : '<div class="empty">No filter — all events pass.</div>'}</div>`
+      + `<div class="panel-head" style="margin-top:18px"><div><h3>Subscriptions</h3><p>Click a subscription for its delivery stats. Templated forwards — URL, headers and JSON body render per event with {{ body }}, {{ pre }}, etc.</p></div><span class="count-pill">${d.subscriptions.length}</span></div><div class="action-list">${d.subscriptions.length ? d.subscriptions.map(s => { const st = s.stats || {}; const enq = st.enqueued ?? s.enqueued ?? 0; const ok = st.delivered_ok ?? s.delivered_ok ?? 0; const fail = st.delivered_failed ?? s.delivered_failed ?? 0; return `<div class="action-item clickable" onclick="openSubscription(${s.id})"><strong>${esc(s.name)}</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${s.headers && Object.keys(s.headers).length ? ` · ${Object.keys(s.headers).length} header${Object.keys(s.headers).length === 1 ? '' : 's'}` : ''}${s.filter_code && String(s.filter_code).trim() ? ' · filtered' : ''}</small><small class="mono">${enq} queued · ${ok} delivered · ${fail} failed — click for details</small>${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}${s.filter_code && String(s.filter_code).trim() ? `<small class="mono">filter: ${esc(s.filter_code)}</small>` : ''}</div>`; }).join('') : '<div class="empty">No subscriptions — events are queued and processed only.</div>'}</div>`;
   } catch (err) { toast(err.message, true); }
 }
 async function openSubscription(id) {
@@ -516,7 +607,7 @@ async function openSubscription(id) {
     $('#subDetailSub').innerHTML = `${s.enabled ? 'enabled' : 'disabled'} · <span class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</span>`;
     const dailyRows = (d.daily || []).map(r => `<tr><td class="mono">${esc(r.day)}</td><td>${r.enqueued ?? 0}</td><td>${r.delivered_ok ?? 0}</td><td>${r.delivered_failed ?? 0}</td></tr>`).join('');
     $('#subscriptionDetail').innerHTML = `<div class="detail-stats">${[['Queued', enq], ['Delivered', ok], ['Failed', fail], ['Pending', pending]].map(x => `<div class="detail-stat"><div class="n">${x[1]}</div><div class="l">${x[0]}</div></div>`).join('')}</div>`
-      + `<div class="panel-head"><div><h3>Configuration</h3><p>How this subscription forwards events.</p></div></div><div class="action-list"><div class="action-item"><strong>Target</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}</small>${s.headers && Object.keys(s.headers).length ? `<pre>${esc(JSON.stringify(s.headers, null, 2))}</pre>` : ''}${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}</div></div>`
+      + `<div class="panel-head"><div><h3>Configuration</h3><p>How this subscription forwards events.</p></div></div><div class="action-list"><div class="action-item"><strong>Target</strong><small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url)}</small><small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}</small>${s.headers && Object.keys(s.headers).length ? `<pre>${esc(JSON.stringify(s.headers, null, 2))}</pre>` : ''}${s.payload_mode === 'custom' && s.payload_template ? `<pre>${esc(s.payload_template)}</pre>` : ''}${s.filter_code && String(s.filter_code).trim() ? `<small><b>Filter:</b></small><pre>${esc(s.filter_code)}</pre><small class="muted">Falsy skips only this subscription.</small>` : '<small class="muted">No filter — all events delivered.</small>'}</div></div>`
       + `<div class="panel-head" style="margin-top:18px"><div><h3>Daily breakdown</h3><p>Per-day delivery counts for the last 30 days.</p></div><span class="count-pill">${(d.daily || []).length}</span></div>${(d.daily || []).length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Day</th><th>Queued</th><th>Delivered</th><th>Failed</th></tr></thead><tbody>${dailyRows}</tbody></table></div>` : '<div class="empty">No deliveries yet.</div>'}`;
   } catch (err) { toast(err.message, true); }
 }

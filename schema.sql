@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
   name TEXT NOT NULL,
   token TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'active',
+  filter_code TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   headers_json TEXT,
   payload_mode TEXT NOT NULL DEFAULT 'passthrough',
   payload_template TEXT,
+  filter_code TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );
