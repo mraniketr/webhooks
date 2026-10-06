@@ -1,15 +1,18 @@
 import { processAnalyticsBatch, processDelivery, processEvent } from "./processing.js";
 
-// Consumer worker for all three queues.
+// Consumer worker for all queues (same artifact, three deployments).
 //
-// - `hooklane-events` (main queue): run the single pre-action (setting the
-//   `pre` key-value object), fan out one task per subscription into
-//   `hooklane-deliveries`, then ack. No D1 writes here — status goes to
-//   structured logs, counts go to the analytics queue.
-//   Delivery failures never block this queue.
-// - `hooklane-deliveries` (task queue): forward one event to one URL with
-//   its own retry budget. Outcome is a structured log (with http_status)
-//   plus an analytics increment — no per-delivery D1 row.
+// - `hooklane-events` (main queue, shared consumer only): run the single
+//   pre-action (setting the `pre` key-value object), fan out one task per
+//   subscription into the owner's tier delivery queue
+//   (`hooklane-deliveries-shared` / `-pro` / `-ded-<slug>`), then ack.
+//   No D1 writes here — status goes to structured logs, counts go to the
+//   analytics queue. Delivery failures never block this queue.
+// - `hooklane-deliveries-*` (tier task queues): forward one event to one URL
+//   with its own retry budget. Outcome is a structured log (with http_status)
+//   plus an analytics increment — no per-delivery D1 row. The shared
+//   deployment consumes `-shared`, the pro deployment consumes `-pro`, and
+//   each dedicated deployment consumes its own `-ded-<slug>` queue.
 // - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
 //   Collapses each batch into one UPSERT per (webhook, day).
 //
@@ -86,7 +89,7 @@ export default {
       return;
     }
 
-    const isDelivery = batch.queue.endsWith("hooklane-deliveries");
+    const isDelivery = batch.queue.includes("hooklane-deliveries");
     const handler = isDelivery ? processDelivery : processEvent;
     const delayFor = isDelivery ? deliveryDelay : eventDelay;
     // Run messages in a batch concurrently — sequential awaits would stack

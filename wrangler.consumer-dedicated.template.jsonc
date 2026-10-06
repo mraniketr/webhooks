@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Template for per-customer dedicated delivery consumers.
+  // Provision with: npm run provision:dedicated -- <slug>
+  // (see scripts/provision-dedicated.sh), which copies this file to
+  // wrangler.consumer-dedicated.<slug>.jsonc replacing __SLUG__/__WORKER_NAME__.
+  "name": "__WORKER_NAME__",
+  "main": "src/consumer.js",
+  "compatibility_date": "2026-10-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hooklane-db",
+      "database_id": "7d4b3e40-3ba2-4d52-84f5-fa24329102e0"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "WEBHOOK_CACHE",
+      "id": "f0e6c89803434a74bb8216e2ecb99500"
+    }
+  ],
+  // Tune max_batch_size / retry_delay per customer contract before deploy.
+  "queues": {
+    "producers": [
+      { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
+    ],
+    "consumers": [
+      {
+        "queue": "hooklane-deliveries-ded-__SLUG__",
+        "max_batch_size": 20,
+        "max_batch_timeout": 0.1,
+        "max_retries": 10,
+        "retry_delay": 30
+      }
+    ]
+  },
+  "observability": { "enabled": true }
+}

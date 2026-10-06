@@ -5,11 +5,21 @@
   "description": "Async webhook service for Cloudflare Workers, D1, Queues and Dynamic Workers",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:consumer": "wrangler dev --config wrangler.consumer.jsonc",
+    "dev:consumer": "wrangler dev --config wrangler.consumer-shared.jsonc",
+    "dev:consumer:legacy": "wrangler dev --config wrangler.consumer.jsonc",
     "deploy": "wrangler deploy",
-    "deploy:consumer": "wrangler deploy --config wrangler.consumer.jsonc",
-    "deploy:all": "wrangler deploy && wrangler deploy --config wrangler.consumer.jsonc",
-    "db:init": "wrangler d1 execute hooklane-db --remote --file=./db/schema.sql"
+    "deploy:consumer": "wrangler deploy --config wrangler.consumer-shared.jsonc",
+    "deploy:consumer:shared": "wrangler deploy --config wrangler.consumer-shared.jsonc",
+    "deploy:consumer:pro": "wrangler deploy --config wrangler.consumer-pro.jsonc",
+    "deploy:consumer:legacy": "wrangler deploy --config wrangler.consumer.jsonc",
+    "deploy:all": "wrangler deploy && wrangler deploy --config wrangler.consumer-shared.jsonc && wrangler deploy --config wrangler.consumer-pro.jsonc",
+    "deploy:dev": "wrangler deploy --config wrangler.dev.jsonc",
+    "deploy:dev:consumer:shared": "wrangler deploy --config wrangler.dev-consumer-shared.jsonc",
+    "deploy:dev:consumer:pro": "wrangler deploy --config wrangler.dev-consumer-pro.jsonc",
+    "deploy:dev:all": "wrangler deploy --config wrangler.dev.jsonc && wrangler deploy --config wrangler.dev-consumer-shared.jsonc && wrangler deploy --config wrangler.dev-consumer-pro.jsonc",
+    "provision:dedicated": "bash scripts/provision-dedicated.sh",
+    "db:init": "wrangler d1 execute hooklane-db --remote --file=./db/schema.sql",
+    "db:migrate:tiers": "wrangler d1 execute hooklane-db --remote --file=./db/migrate-tiered-plans.sql"
   },
   "devDependencies": {
     "wrangler": "latest"

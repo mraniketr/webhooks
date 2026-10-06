@@ -1,5 +1,5 @@
 import { buildContext, evaluateFilter, evaluatePreAssignment, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
-import { getWebhookByToken, invalidateAllSubscriptions, invalidateRouteConfig, invalidateSubscription, invalidateWebhook } from "./cache.js";
+import { getPlanConfig, getUserTier, getWebhookByToken, invalidateAllSubscriptions, invalidatePlans, invalidateRouteConfig, invalidateSubscription, invalidateUserTier, invalidateWebhook } from "./cache.js";
 
 // Queue messages cap at 128 KiB — keep inbound bodies well under that so the
 // full event (payload + headers + query + envelope) fits in one message.
@@ -121,7 +121,9 @@ async function apiJson(user, env, ttlMs, body, status = 200) {
   return json(body, status, await refreshedSessionHeaders(user, env, ttlMs));
 }
 
-function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at }; }
+function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at,
+  plan: normalizePlan(u.plan), dedicated_queue: u.dedicated_queue ?? null,
+  tps_override: u.tps_override ?? null, is_admin: Number(u.is_admin ?? 0) }; }
 // Subscription-level analytics only: counts come from subscription_counters
 // (maintained async by the analytics queue), never from per-event rows.
 // Webhooks carry no counters of their own.
@@ -484,7 +486,11 @@ async function auth(request, env) {
   const sid = getCookie(request, "sid");
   const uid = await verifySession(sid, env.APP_SECRET);
   if (!uid) return null;
-  return await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(uid).first();
+  try {
+    return await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(uid).first();
+  } catch {
+    return await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(uid).first();
+  }
 }
 
 // API + producer worker: serves HTTP and enqueues webhook events.
@@ -492,12 +498,171 @@ async function auth(request, env) {
 
 async function rateLimit(request, env, userId) {
   // Rate-limit binding may be unavailable on some plans — fail open.
+  // This is only the coarse global guardrail; per-tier TPS is enforced by
+  // tierRateLimit() below (runtime-configurable via the plans table).
   try {
     if (!env.USER_RATE_LIMITER) return { success: true };
     return await env.USER_RATE_LIMITER.limit({ key: String(userId) });
   } catch {
     return { success: true };
   }
+}
+
+// ---- Tiered queues: plan resolution + configurable per-tier TPS ----
+// Plans live in D1 (editable via Admin API, cached ~15s). The Workers
+// Rate-Limit binding can't vary per tier (limit is fixed in wrangler.jsonc),
+// so tier TPS is enforced here with a best-effort fixed-window counter in
+// KV (cross-isolate) with an in-memory per-isolate fallback. Over-admission
+// under races is possible; the binding above stays as the hard guardrail.
+const VALID_PLANS = new Set(["free", "pro", "dedicated"]);
+const FALLBACK_PLAN_LIMITS = {
+  free: { tps_limit: 10, burst_limit: 20, window_seconds: 60 },
+  pro: { tps_limit: 100, burst_limit: 200, window_seconds: 60 },
+  dedicated: { tps_limit: 1000, burst_limit: 2000, window_seconds: 60 },
+};
+const DEDICATED_QUEUE_RE = /^hooklane-deliveries-ded-[a-z0-9][a-z0-9-]{0,59}$/;
+const MEMORY_RL_KEY = "__hooklane_tier_rl";
+
+function normalizePlan(v) {
+  const s = String(v || "").trim().toLowerCase();
+  return VALID_PLANS.has(s) ? s : "free";
+}
+
+function memoryRl() {
+  if (!globalThis[MEMORY_RL_KEY]) globalThis[MEMORY_RL_KEY] = new Map();
+  return globalThis[MEMORY_RL_KEY];
+}
+
+async function ensureUserTierColumns(env) {
+  try {
+    const cols = await env.DB.prepare("PRAGMA table_info(users)").all();
+    const names = new Set((cols.results || []).map((c) => c.name));
+    if (!names.has("plan")) await env.DB.prepare("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'").run();
+    if (!names.has("dedicated_queue")) await env.DB.prepare("ALTER TABLE users ADD COLUMN dedicated_queue TEXT").run();
+    if (!names.has("tps_override")) await env.DB.prepare("ALTER TABLE users ADD COLUMN tps_override INTEGER").run();
+    if (!names.has("is_admin")) await env.DB.prepare("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0").run();
+  } catch { /* ignore — callers fall back to free tier */ }
+}
+
+async function ensurePlansTable(env) {
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS plans (
+      plan TEXT PRIMARY KEY CHECK(plan IN ('free','pro','dedicated')),
+      tps_limit INTEGER NOT NULL,
+      burst_limit INTEGER NOT NULL,
+      window_seconds INTEGER NOT NULL DEFAULT 60,
+      updated_at TEXT NOT NULL
+    )`).run();
+    const ts = now();
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('free',10,20,60,?)").bind(ts),
+      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('pro',100,200,60,?)").bind(ts),
+      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('dedicated',1000,2000,60,?)").bind(ts),
+    ]);
+  } catch { /* ignore — callers fall back to defaults */ }
+}
+
+async function loadPlanConfig(env) {
+  await ensurePlansTable(env);
+  try {
+    const rows = await env.DB.prepare("SELECT plan,tps_limit,burst_limit,window_seconds FROM plans").all();
+    const out = {};
+    for (const r of rows.results || []) {
+      const plan = normalizePlan(r.plan);
+      out[plan] = {
+        tps_limit: Math.max(1, Number(r.tps_limit) || FALLBACK_PLAN_LIMITS[plan].tps_limit),
+        burst_limit: Math.max(1, Number(r.burst_limit) || FALLBACK_PLAN_LIMITS[plan].burst_limit),
+        window_seconds: Math.min(3600, Math.max(10, Number(r.window_seconds) || 60)),
+      };
+    }
+    return { ...structuredFallbackPlans(), ...out };
+  } catch {
+    return structuredFallbackPlans();
+  }
+}
+
+function structuredFallbackPlans() {
+  return JSON.parse(JSON.stringify(FALLBACK_PLAN_LIMITS));
+}
+
+function effectiveTierLimit(planCfg, tierRow) {
+  const cfg = planCfg?.[tierRow.plan] || FALLBACK_PLAN_LIMITS[tierRow.plan] || FALLBACK_PLAN_LIMITS.free;
+  const override = tierRow.tps_override != null && Number(tierRow.tps_override) > 0
+    ? Math.floor(Number(tierRow.tps_override))
+    : null;
+  return {
+    tps_limit: override || cfg.tps_limit,
+    burst_limit: Math.max(override || cfg.tps_limit, cfg.burst_limit),
+    window_seconds: cfg.window_seconds,
+    overridden: override != null,
+  };
+}
+
+async function loadUserTier(env, userId) {
+  await ensureUserTierColumns(env);
+  try {
+    const row = await env.DB.prepare("SELECT plan,dedicated_queue,tps_override FROM users WHERE id=?").bind(userId).first();
+    if (!row) return { plan: "free", dedicated_queue: null, tps_override: null };
+    return {
+      plan: normalizePlan(row.plan),
+      dedicated_queue: row.dedicated_queue || null,
+      tps_override: row.tps_override != null && Number(row.tps_override) > 0 ? Math.floor(Number(row.tps_override)) : null,
+    };
+  } catch {
+    return { plan: "free", dedicated_queue: null, tps_override: null };
+  }
+}
+
+async function kvRlIncrement(env, key, windowSeconds) {
+  // Returns the new count, or null when KV is unavailable (caller falls back
+  // to memory). Read-modify-write races can over-admit slightly — accepted
+  // for a gateway TPS gate; the Workers binding is the hard ceiling.
+  try {
+    const kv = env?.WEBHOOK_CACHE;
+    if (!kv || typeof kv.get !== "function" || typeof kv.put !== "function") return null;
+    const raw = await kv.get(key, "text");
+    const count = (raw ? parseInt(raw, 10) || 0 : 0) + 1;
+    await kv.put(key, String(count), { expirationTtl: Math.max(1, Math.ceil(windowSeconds * 2)) });
+    return count;
+  } catch {
+    return null;
+  }
+}
+
+function memoryRlIncrement(key, windowSeconds) {
+  const m = memoryRl();
+  const nowMs = Date.now();
+  const entry = m.get(key);
+  if (!entry || entry.exp <= nowMs) {
+    const fresh = { count: 1, exp: nowMs + windowSeconds * 1000 };
+    m.set(key, fresh);
+    return 1;
+  }
+  entry.count += 1;
+  return entry.count;
+}
+
+async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
+  const limits = effectiveTierLimit(planCfg, tierRow);
+  const win = limits.window_seconds;
+  const windowStart = Math.floor(Date.now() / 1000 / win);
+  const sustainedKey = `rl:tier:${userId}:${limits.tps_limit}:${win}:${windowStart}`;
+  let count = await kvRlIncrement(env, sustainedKey, win);
+  if (count == null) count = memoryRlIncrement(sustainedKey, win);
+  if (count > limits.tps_limit) {
+    return { allowed: false, limits, count, retryAfter: win, reason: "tps" };
+  }
+  // Burst gate: 10s sub-window capped at burst_limit scaled to 10s.
+  const burstWindow = 10;
+  const burstCap = Math.max(1, Math.ceil(limits.burst_limit * burstWindow / Math.max(1, win)));
+  const burstStart = Math.floor(Date.now() / 1000 / burstWindow);
+  const burstKey = `rl:burst:${userId}:${burstCap}:${burstWindow}:${burstStart}`;
+  let bcount = await kvRlIncrement(env, burstKey, burstWindow);
+  if (bcount == null) bcount = memoryRlIncrement(burstKey, burstWindow);
+  if (bcount > burstCap) {
+    return { allowed: false, limits, count: bcount, retryAfter: burstWindow, reason: "burst" };
+  }
+  return { allowed: true, limits, count, remaining: Math.max(0, limits.tps_limit - count) };
 }
 
 export default {
@@ -615,7 +780,12 @@ export default {
         if (!user) return json({ error: "Authentication required" }, 401);
 
         if (request.method === "GET" && p === "/api/me") {
-          return apiJson(user, env, ttlMs, { user: sanitizeUser(user), rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+          const plan = normalizePlan(user.plan);
+          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const limits = effectiveTierLimit(planCfg, { plan, tps_override: user.tps_override != null ? Number(user.tps_override) : null });
+          return apiJson(user, env, ttlMs, { user: sanitizeUser(user), plan,
+            rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD },
+            tierRateLimit: { tps: limits.tps_limit, burst: limits.burst_limit, windowSeconds: limits.window_seconds, overridden: limits.overridden } });
         }
 
         if (request.method === "GET" && p === "/api/dashboard") {
@@ -821,6 +991,109 @@ export default {
           const r = evaluateFilter(code, ctx);
           return apiJson(user, env, ttlMs, { allow: r.allow, error: r.error, value: typeof r.value === "object" ? JSON.stringify(r.value) : r.value, context: ctx });
         }
+
+        // ---- Admin: tier + TPS management (is_admin only) ----
+        if (p.startsWith("/api/admin/")) {
+          const isAdmin = Number(user.is_admin ?? 0) === 1 ||
+            (env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).includes(String(user.email || "").toLowerCase());
+          if (!isAdmin) return apiJson(user, env, ttlMs, { error: "Forbidden" }, 403);
+
+          if (request.method === "GET" && p === "/api/admin/plans") {
+            await ensurePlansTable(env);
+            const cfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            return apiJson(user, env, ttlMs, { plans: ["free", "pro", "dedicated"].map((plan) => ({ plan, ...cfg[plan] })) });
+          }
+
+          const planMatch = p.match(/^\/api\/admin\/plans\/(free|pro|dedicated)$/);
+          if ((request.method === "PUT" || request.method === "PATCH") && planMatch) {
+            const plan = planMatch[1];
+            const b = await readJson(request);
+            const tps = b.tps_limit ?? b.tps;
+            const burst = b.burst_limit ?? b.burst;
+            const win = b.window_seconds ?? b.windowSeconds ?? b.window;
+            if (tps !== undefined && (!Number.isInteger(Number(tps)) || Number(tps) < 1 || Number(tps) > 100000)) {
+              return apiJson(user, env, ttlMs, { error: "tps_limit must be an integer 1..100000" }, 400);
+            }
+            if (burst !== undefined && (!Number.isInteger(Number(burst)) || Number(burst) < 1 || Number(burst) > 200000)) {
+              return apiJson(user, env, ttlMs, { error: "burst_limit must be an integer 1..200000" }, 400);
+            }
+            if (win !== undefined && (!Number.isInteger(Number(win)) || Number(win) < 10 || Number(win) > 3600)) {
+              return apiJson(user, env, ttlMs, { error: "window_seconds must be an integer 10..3600" }, 400);
+            }
+            await ensurePlansTable(env);
+            const current = await env.DB.prepare("SELECT tps_limit,burst_limit,window_seconds FROM plans WHERE plan=?").bind(plan).first()
+              .catch(() => null) || FALLBACK_PLAN_LIMITS[plan];
+            const next = {
+              tps_limit: tps !== undefined ? Math.floor(Number(tps)) : Number(current.tps_limit),
+              burst_limit: burst !== undefined ? Math.floor(Number(burst)) : Number(current.burst_limit),
+              window_seconds: win !== undefined ? Math.floor(Number(win)) : Number(current.window_seconds),
+            };
+            await env.DB.prepare("UPDATE plans SET tps_limit=?, burst_limit=?, window_seconds=?, updated_at=? WHERE plan=?")
+              .bind(next.tps_limit, next.burst_limit, next.window_seconds, now(), plan).run();
+            invalidatePlans(env, ctx);
+            console.log(JSON.stringify({ level: "info", msg: "plan TPS updated", plan, ...next, by: user.id }));
+            return apiJson(user, env, ttlMs, { plan, ...next });
+          }
+
+          const userPlanMatch = p.match(/^\/api\/admin\/users\/(\d+)\/plan$/);
+          if ((request.method === "PUT" || request.method === "PATCH") && userPlanMatch) {
+            const targetId = Number(userPlanMatch[1]);
+            const b = await readJson(request);
+            if (b.plan === undefined) return apiJson(user, env, ttlMs, { error: "plan is required" }, 400);
+            const plan = normalizePlan(b.plan);
+            if (b.plan != null && !VALID_PLANS.has(String(b.plan).trim().toLowerCase())) {
+              return apiJson(user, env, ttlMs, { error: "plan must be free, pro or dedicated" }, 400);
+            }
+            let dedicatedQueue = b.dedicated_queue ?? b.dedicatedQueue ?? null;
+            if (dedicatedQueue != null && String(dedicatedQueue).trim() !== "") {
+              dedicatedQueue = String(dedicatedQueue).trim();
+              if (!DEDICATED_QUEUE_RE.test(dedicatedQueue)) {
+                return apiJson(user, env, ttlMs, { error: "dedicated_queue must match hooklane-deliveries-ded-<slug>" }, 400);
+              }
+            } else {
+              dedicatedQueue = null;
+            }
+            if (plan === "dedicated" && !dedicatedQueue) {
+              return apiJson(user, env, ttlMs, { error: "dedicated_queue is required for the dedicated plan" }, 400);
+            }
+            let override = b.tps_override ?? b.tpsOverride ?? null;
+            if (override === "" || override === 0) override = null;
+            if (override != null && (!Number.isInteger(Number(override)) || Number(override) < 1 || Number(override) > 100000)) {
+              return apiJson(user, env, ttlMs, { error: "tps_override must be an integer 1..100000 or null" }, 400);
+            }
+            await ensureUserTierColumns(env);
+            const exists = await env.DB.prepare("SELECT id FROM users WHERE id=?").bind(targetId).first().catch(() => null);
+            if (!exists) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+            await env.DB.prepare("UPDATE users SET plan=?, dedicated_queue=?, tps_override=? WHERE id=?")
+              .bind(plan, dedicatedQueue, override != null ? Math.floor(Number(override)) : null, targetId).run();
+            invalidateUserTier(env, ctx, targetId);
+            console.log(JSON.stringify({ level: "info", msg: "user plan updated", userId: targetId, plan, dedicatedQueue, by: user.id }));
+            const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(targetId).first().catch(() => null);
+            return apiJson(user, env, ttlMs, { user: updated ? sanitizeUser(updated) : { id: targetId, plan } });
+          }
+
+          if (request.method === "POST" && p === "/api/admin/dedicated/provision") {
+            const b = await readJson(request);
+            const slug = String(b.slug || "").trim().toLowerCase();
+            if (!/^[a-z0-9][a-z0-9-]{0,59}$/.test(slug)) {
+              return apiJson(user, env, ttlMs, { error: "slug must be lowercase letters, numbers, hyphens" }, 400);
+            }
+            const queue = `hooklane-deliveries-ded-${slug}`;
+            const worker = `webhooks-consumer-ded-${slug}`;
+            const config = `wrangler.consumer-dedicated.${slug}.jsonc`;
+            return apiJson(user, env, ttlMs, {
+              slug, queue, worker, config,
+              steps: [
+                `npx wrangler queues create ${queue}`,
+                `npm run provision:dedicated -- ${slug}`,
+                `npx wrangler deploy --config ${config}`,
+                `PUT /api/admin/users/<id>/plan {"plan":"dedicated","dedicated_queue":"${queue}"}`,
+              ],
+            });
+          }
+
+          return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
+        }
       }
 
       const publicMatch = p.match(/^\/webhooks\/([^/]+)$/);
@@ -847,8 +1120,24 @@ export default {
           raw = await rawPromise;
         }
         if (!hook || hook.status !== "active") return json({ error: "Webhook not found" }, 404);
+        // Tier resolution (cached ~30s): drives per-plan TPS + stamps the
+        // tier onto the event so fan-out routes to the right delivery queue
+        // even if the plan changes mid-flight.
+        const [tierRow, planCfg] = await Promise.all([
+          getUserTier(env, ctx, hook.user_id, () => loadUserTier(env, hook.user_id)).catch(() => ({ plan: "free", dedicated_queue: null, tps_override: null })),
+          getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans()),
+        ]);
+        const tier = normalizePlan(tierRow?.plan);
+        const tierCheck = await tierRateLimit(env, ctx, hook.user_id, { ...tierRow, plan: tier }, planCfg);
+        if (!tierCheck.allowed) {
+          return json({ error: "Rate limit exceeded", plan: tier }, 429, {
+            "retry-after": String(tierCheck.retryAfter || 60),
+            "x-plan": tier,
+            "x-tps-limit": String(tierCheck.limits.tps_limit),
+          });
+        }
         const rl = await rateLimit(request, env, hook.user_id);
-        if (!rl.success) return json({ error: "Rate limit exceeded" }, 429, { "retry-after": "60" });
+        if (!rl.success) return json({ error: "Rate limit exceeded", plan: tier }, 429, { "retry-after": "60", "x-plan": tier });
         const payload = parsePayload(request, raw);
         const received = now();
         // No D1 write on ingest — the event travels in the queue message.
@@ -858,6 +1147,8 @@ export default {
         const eventMessage = {
           eventId,
           webhookId: hook.id,
+          tier,
+          dedicatedQueue: tier === "dedicated" ? (tierRow?.dedicated_queue || null) : null,
           method: request.method,
           headers: Object.fromEntries(request.headers.entries()),
           query: Object.fromEntries(url.searchParams.entries()),
@@ -866,8 +1157,9 @@ export default {
           ip: request.headers.get("cf-connecting-ip") || "",
           receivedAt: received,
         };
-        await env.WEBHOOK_QUEUE.send(eventMessage);
-        return json({ accepted: true, eventId, status: "queued" }, 202);
+        const eventsQueue = env.EVENT_QUEUE || env.WEBHOOK_QUEUE;
+        await eventsQueue.send(eventMessage);
+        return json({ accepted: true, eventId, status: "queued", tier }, 202);
       }
 
       return env.ASSETS.fetch(request);
