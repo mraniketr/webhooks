@@ -25,7 +25,9 @@ export default {
   },
 
   async queue(batch, env, ctx) {
-    if (batch.queue === "hooklane-analytics") {
+    // Match by suffix so both prod (`hooklane-*`) and dev (`dev-hooklane-*`)
+    // queue names route correctly.
+    if (batch.queue.endsWith("hooklane-analytics")) {
       try {
         await processAnalyticsBatch(batch.messages, env);
         for (const message of batch.messages) message.ack();
@@ -43,7 +45,7 @@ export default {
       return;
     }
 
-    const handler = batch.queue === "hooklane-deliveries" ? processDelivery : processEvent;
+    const handler = batch.queue.endsWith("hooklane-deliveries") ? processDelivery : processEvent;
     // Run messages in a batch concurrently — sequential awaits would stack
     // per-message latency (notably the outbound fetch in processDelivery).
     await Promise.all(batch.messages.map(async (message) => {
