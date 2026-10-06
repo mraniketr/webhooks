@@ -1,9 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  // Note: reuses the legacy `dev-webhooks-consumer` worker name so the old
-  // single-queue consumer is replaced in place (the OAuth token cannot
-  // delete workers). Old dev-hooklane-deliveries is left unconsumed.
-  "name": "dev-webhooks-consumer",
+  "name": "dev-webhooks-router",
   "main": "src/router.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
