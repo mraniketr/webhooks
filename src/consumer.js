@@ -13,6 +13,37 @@ import { processAnalyticsBatch, processDelivery, processEvent } from "./processi
 // - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
 //   Collapses each batch into one UPSERT per (webhook, day).
 //
+// Exponential backoff for queue retries, capped at 1 day (Queues
+// `delaySeconds` max is 24h). Uses per-message `attempts` (1 on first
+// delivery) so a slow/down downstream backs off as:
+// 60s, 120s, 240s, ... capped at 86400s. ~11 retries ≈ 1 day total.
+const ONE_DAY_SECONDS = 86400;
+const DELIVERY_BASE_SECONDS = 60;
+const EVENT_BASE_SECONDS = 10;
+const ANALYTICS_BASE_SECONDS = 30;
+
+function backoffDelay(attempts, baseSeconds, capSeconds = ONE_DAY_SECONDS) {
+  const a = Math.max(1, Number(attempts) || 1);
+  const exp = baseSeconds * 2 ** (a - 1);
+  const capped = Math.min(capSeconds, Math.max(1, Math.floor(exp)));
+  // ±20% jitter (min 1s) so a multi-tenant burst doesn't retry in lockstep.
+  const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(capped * 0.2)));
+  return Math.min(capSeconds, Math.max(1, capped + jitter - Math.floor(capped * 0.1)));
+}
+
+function deliveryDelay(attempts) {
+  return backoffDelay(attempts, DELIVERY_BASE_SECONDS);
+}
+
+function eventDelay(attempts) {
+  // Internal fan-out should stay fast: cap well under a day.
+  return backoffDelay(attempts, EVENT_BASE_SECONDS, 900);
+}
+
+function analyticsDelay(attempts) {
+  return backoffDelay(attempts, ANALYTICS_BASE_SECONDS, 3600);
+}
+
 // This worker has no HTTP routes; `fetch` only exists so direct hits
 // return a clear 404 instead of a missing-handler error.
 
@@ -35,17 +66,25 @@ export default {
         console.error(
           JSON.stringify({
             level: "error",
-            msg: "analytics batch failed, retrying",
+            msg: "analytics batch failed, retrying with backoff",
             queue: batch.queue,
             error: error?.message || String(error),
           })
         );
-        for (const message of batch.messages) message.retry();
+        const maxAttempts = Math.max(...batch.messages.map((m) => Number(m.attempts) || 1), 1);
+        const delaySeconds = analyticsDelay(maxAttempts);
+        try {
+          batch.retryAll({ delaySeconds });
+        } catch {
+          for (const message of batch.messages) message.retry({ delaySeconds });
+        }
       }
       return;
     }
 
-    const handler = batch.queue.endsWith("hooklane-deliveries") ? processDelivery : processEvent;
+    const isDelivery = batch.queue.endsWith("hooklane-deliveries");
+    const handler = isDelivery ? processDelivery : processEvent;
+    const delayFor = isDelivery ? deliveryDelay : eventDelay;
     // Run messages in a batch concurrently — sequential awaits would stack
     // per-message latency (notably the outbound fetch in processDelivery).
     await Promise.all(batch.messages.map(async (message) => {
@@ -53,16 +92,23 @@ export default {
         await handler(message.body, env, ctx);
         message.ack();
       } catch (error) {
+        const delaySeconds = delayFor(message.attempts);
         console.error(
           JSON.stringify({
             level: "error",
-            msg: "queue message failed, retrying",
+            msg: "queue message failed, retrying with backoff",
             queue: batch.queue,
+            attempt: Number(message.attempts) || 1,
+            delaySeconds,
             body: message.body,
             error: error?.message || String(error),
           })
         );
-        message.retry();
+        try {
+          message.retry({ delaySeconds });
+        } catch {
+          message.retry();
+        }
       }
     }));
   },
