@@ -13,10 +13,14 @@ import { processAnalyticsBatch, processDelivery, processEvent } from "./processi
 // - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
 //   Collapses each batch into one UPSERT per (webhook, day).
 //
-// Exponential backoff for queue retries, capped at 1 day (Queues
-// `delaySeconds` max is 24h). Uses per-message `attempts` (1 on first
+// Exponential backoff for queue retries, total window held under 24h
+// (Queues `delaySeconds` max is 24h). Uses per-message `attempts` (1 on first
 // delivery) so a slow/down downstream backs off as:
-// 60s, 120s, 240s, ... capped at 86400s. ~11 retries ≈ 1 day total.
+// Deliveries (base 60s x 10 retries): 60s, 120s, ..., 30720s ≈ 17.05h total.
+// Events (base 10s x 8 retries, cap 900s): ≈ 36m total.
+// Analytics (base 30s x 8 retries, cap 3600s): ≈ 2.06h total.
+// All totals stay under 86400s even with ±10% jitter. Queue `max_retries`
+// in wrangler.consumer.jsonc enforces the same budgets (10/8/8).
 const ONE_DAY_SECONDS = 86400;
 const DELIVERY_BASE_SECONDS = 60;
 const EVENT_BASE_SECONDS = 10;
