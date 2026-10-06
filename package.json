@@ -15,8 +15,9 @@
     "deploy:all": "wrangler deploy && wrangler deploy --config wrangler.router.jsonc && wrangler deploy --config wrangler.delivery.jsonc",
     "deploy:dev": "wrangler deploy --config wrangler.dev.jsonc",
     "deploy:dev:router": "wrangler deploy --config wrangler.dev-router.jsonc",
-    "deploy:dev:delivery": "wrangler deploy --config wrangler.dev-delivery.jsonc",
-    "deploy:dev:all": "wrangler deploy --config wrangler.dev.jsonc && wrangler deploy --config wrangler.dev-router.jsonc && wrangler deploy --config wrangler.dev-delivery.jsonc",
+    "deploy:dev:delivery:shared": "wrangler deploy --config wrangler.dev-delivery-shared.jsonc",
+    "deploy:dev:delivery:pro": "wrangler deploy --config wrangler.dev-delivery-pro.jsonc",
+    "deploy:dev:all": "wrangler deploy --config wrangler.dev.jsonc && wrangler deploy --config wrangler.dev-router.jsonc && wrangler deploy --config wrangler.dev-delivery-shared.jsonc && wrangler deploy --config wrangler.dev-delivery-pro.jsonc",
     "provision:dedicated": "bash scripts/provision-dedicated.sh",
     "db:init": "wrangler d1 execute hooklane-db --remote --file=./db/schema.sql",
     "db:migrate:tiers": "wrangler d1 execute hooklane-db --remote --file=./db/migrate-tiered-plans.sql"
