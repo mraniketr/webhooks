@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "webhooks-consumer-shared",
-  "main": "src/consumer.js",
+  "name": "webhooks-router",
+  "main": "src/router.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -16,11 +16,10 @@
       "id": "f0e6c89803434a74bb8216e2ecb99500"
     }
   ],
-  // Shared-tier consumer. Owns hooklane-events fan-out (the ONLY events
-  // consumer — do not attach the pro/dedicated workers to hooklane-events)
-  // plus shared deliveries and analytics.
-  // Legacy note: wrangler.consumer.jsonc (hooklane-deliveries) is kept for
-  // drain only. After the old queue drains, delete it and this comment.
+  // Router worker: the ONLY consumer of hooklane-events. Runs the pre-action,
+  // fans out one task per subscription into the owner's tier delivery queue,
+  // and owns the analytics queue writer. Delivery queues live in
+  // wrangler.delivery.jsonc — never attach them here.
   "queues": {
     "producers": [
       { "binding": "DELIVERY_SHARED", "queue": "hooklane-deliveries-shared" },
@@ -34,13 +33,6 @@
         "max_batch_timeout": 0.1,
         "max_retries": 8,
         "retry_delay": 10
-      },
-      {
-        "queue": "hooklane-deliveries-shared",
-        "max_batch_size": 10,
-        "max_batch_timeout": 0.1,
-        "max_retries": 10,
-        "retry_delay": 60
       },
       {
         "queue": "hooklane-analytics",

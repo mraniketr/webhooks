@@ -1,58 +1,16 @@
-import { processAnalyticsBatch, processDelivery, processEvent } from "./processing.js";
+import { processAnalyticsBatch } from "./analytics.js";
+import { processEvent } from "./router.js";
+import { processDelivery } from "./delivery.js";
+import { analyticsDelay, deliveryDelay, eventDelay } from "./processing.js";
 
-// Consumer worker for all queues (same artifact, three deployments).
+// Legacy consumer worker — DRAIN ONLY.
 //
-// - `hooklane-events` (main queue, shared consumer only): run the single
-//   pre-action (setting the `pre` key-value object), fan out one task per
-//   subscription into the owner's tier delivery queue
-//   (`hooklane-deliveries-shared` / `-pro` / `-ded-<slug>`), then ack.
-//   No D1 writes here — status goes to structured logs, counts go to the
-//   analytics queue. Delivery failures never block this queue.
-// - `hooklane-deliveries-*` (tier task queues): forward one event to one URL
-//   with its own retry budget. Outcome is a structured log (with http_status)
-//   plus an analytics increment — no per-delivery D1 row. The shared
-//   deployment consumes `-shared`, the pro deployment consumes `-pro`, and
-//   each dedicated deployment consumes its own `-ded-<slug>` queue.
-// - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
-//   Collapses each batch into one UPSERT per (webhook, day).
-//
-// Exponential backoff for queue retries, total window held under 24h
-// (Queues `delaySeconds` max is 24h). Uses per-message `attempts` (1 on first
-// delivery) so a slow/down downstream backs off as:
-// Deliveries (base 60s x 10 retries): 60s, 120s, ..., 30720s ≈ 17.05h total.
-// Events (base 10s x 8 retries, cap 900s): ≈ 36m total.
-// Analytics (base 30s x 8 retries, cap 3600s): ≈ 2.06h total.
-// All totals stay under 86400s even with ±10% jitter. Queue `max_retries`
-// in wrangler.consumer.jsonc enforces the same budgets (10/8/8).
-const ONE_DAY_SECONDS = 86400;
-const DELIVERY_BASE_SECONDS = 60;
-const EVENT_BASE_SECONDS = 10;
-const ANALYTICS_BASE_SECONDS = 30;
-
-function backoffDelay(attempts, baseSeconds, capSeconds = ONE_DAY_SECONDS) {
-  const a = Math.max(1, Number(attempts) || 1);
-  const exp = baseSeconds * 2 ** (a - 1);
-  const capped = Math.min(capSeconds, Math.max(1, Math.floor(exp)));
-  // ±20% jitter (min 1s) so a multi-tenant burst doesn't retry in lockstep.
-  const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(capped * 0.2)));
-  return Math.min(capSeconds, Math.max(1, capped + jitter - Math.floor(capped * 0.1)));
-}
-
-function deliveryDelay(attempts) {
-  return backoffDelay(attempts, DELIVERY_BASE_SECONDS);
-}
-
-function eventDelay(attempts) {
-  // Internal fan-out should stay fast: cap well under a day.
-  return backoffDelay(attempts, EVENT_BASE_SECONDS, 900);
-}
-
-function analyticsDelay(attempts) {
-  return backoffDelay(attempts, ANALYTICS_BASE_SECONDS, 3600);
-}
-
-// This worker has no HTTP routes; `fetch` only exists so direct hits
-// return a clear 404 instead of a missing-handler error.
+// This shim keeps the old single-worker deployment (`wrangler.consumer.jsonc`,
+// consuming the legacy `hooklane-events` / `hooklane-deliveries` /
+// `hooklane-analytics` queues) runnable while the old delivery queue drains.
+// Each branch delegates to the handler owned by its own module — no queue
+// logic lives here. Do not add new behavior; deploy the router + delivery
+// workers for all live traffic.
 
 export default {
   async fetch() {

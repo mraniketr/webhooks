@@ -1,7 +1,9 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
+  // Note: reuses the `dev-webhooks-consumer-pro` worker name to replace it
+  // in place (the OAuth token cannot delete workers).
   "name": "dev-webhooks-consumer-pro",
-  "main": "src/consumer.js",
+  "main": "src/delivery.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -16,13 +18,20 @@
       "id": "e1900d49f76c4329b87fc652261e4413"
     }
   ],
-  // Pro-tier delivery consumer. Same src/consumer.js artifact as shared —
-  // only the consumers[] list differs.
+  // Dev delivery worker for the shared + pro tiers. Never attach
+  // dev-hooklane-events or dev-hooklane-analytics here — router only.
   "queues": {
     "producers": [
       { "binding": "ANALYTICS_QUEUE", "queue": "dev-hooklane-analytics" }
     ],
     "consumers": [
+      {
+        "queue": "dev-hooklane-deliveries-shared",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0.1,
+        "max_retries": 10,
+        "retry_delay": 60
+      },
       {
         "queue": "dev-hooklane-deliveries-pro",
         "max_batch_size": 20,

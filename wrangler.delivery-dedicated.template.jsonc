@@ -1,11 +1,11 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  // Template for per-customer dedicated delivery consumers.
+  // Template for per-customer dedicated delivery workers.
   // Provision with: npm run provision:dedicated -- <slug>
   // (see scripts/provision-dedicated.sh), which copies this file to
-  // wrangler.consumer-dedicated.<slug>.jsonc replacing __SLUG__/__WORKER_NAME__.
+  // wrangler.delivery-dedicated.<slug>.jsonc replacing __SLUG__/__WORKER_NAME__.
   "name": "__WORKER_NAME__",
-  "main": "src/consumer.js",
+  "main": "src/delivery.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {

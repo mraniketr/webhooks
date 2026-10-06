@@ -1,7 +1,10 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
+  // Note: reuses the legacy `dev-webhooks-consumer` worker name so the old
+  // single-queue consumer is replaced in place (the OAuth token cannot
+  // delete workers). Old dev-hooklane-deliveries is left unconsumed.
   "name": "dev-webhooks-consumer",
-  "main": "src/consumer.js",
+  "main": "src/router.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -16,9 +19,8 @@
       "id": "e1900d49f76c4329b87fc652261e4413"
     }
   ],
-  // Shared-tier consumer (replaces the legacy single-queue dev consumer).
-  // Owns dev-hooklane-events fan-out plus shared deliveries and analytics.
-  // Legacy dev-hooklane-deliveries is left unconsumed for drain.
+  // Dev router worker: the ONLY consumer of dev-hooklane-events, plus the
+  // analytics queue. Delivery queues live in wrangler.dev-delivery.jsonc.
   "queues": {
     "producers": [
       { "binding": "DELIVERY_SHARED", "queue": "dev-hooklane-deliveries-shared" },
@@ -32,13 +34,6 @@
         "max_batch_timeout": 0.1,
         "max_retries": 8,
         "retry_delay": 10
-      },
-      {
-        "queue": "dev-hooklane-deliveries-shared",
-        "max_batch_size": 10,
-        "max_batch_timeout": 0.1,
-        "max_retries": 10,
-        "retry_delay": 60
       },
       {
         "queue": "dev-hooklane-analytics",
