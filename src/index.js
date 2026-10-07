@@ -494,7 +494,8 @@ async function auth(request, env) {
 }
 
 // API + producer worker: serves HTTP and enqueues webhook events.
-// Queue consumption lives in src/consumer.js (webhooks-consumer worker).
+// Queue consumption lives in src/router.js (webhooks-router) and
+// src/delivery.js (webhooks-delivery).
 
 async function rateLimit(request, env, userId) {
   // Rate-limit binding may be unavailable on some plans — fail open.
@@ -1079,8 +1080,8 @@ export default {
               return apiJson(user, env, ttlMs, { error: "slug must be lowercase letters, numbers, hyphens" }, 400);
             }
             const queue = `hooklane-deliveries-ded-${slug}`;
-            const worker = `webhooks-consumer-ded-${slug}`;
-            const config = `wrangler.consumer-dedicated.${slug}.jsonc`;
+            const worker = `webhooks-delivery-ded-${slug}`;
+            const config = `wrangler.delivery-dedicated.${slug}.jsonc`;
             return apiJson(user, env, ttlMs, {
               slug, queue, worker, config,
               steps: [
