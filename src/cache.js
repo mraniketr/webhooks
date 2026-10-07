@@ -49,6 +49,8 @@ function ttls(env) {
     tokenTtlMs: numEnv(env, "WEBHOOK_TOKEN_CACHE_TTL_SECONDS", DEFAULTS.tokenTtlMs / 1000) * 1000,
     configTtlMs: numEnv(env, "WEBHOOK_CONFIG_CACHE_TTL_SECONDS", DEFAULTS.configTtlMs / 1000) * 1000,
     subscriptionTtlMs: numEnv(env, "SUBSCRIPTION_CACHE_TTL_SECONDS", DEFAULTS.subscriptionTtlMs / 1000) * 1000,
+    tierTtlMs: numEnv(env, "TIER_CACHE_TTL_SECONDS", 30) * 1000,
+    planTtlMs: numEnv(env, "PLAN_CACHE_TTL_SECONDS", 15) * 1000,
     negativeTtlMs: DEFAULTS.negativeTtlMs,
     maxEntries: DEFAULTS.maxEntries,
   };
@@ -189,6 +191,10 @@ function webhookRowKey(webhookId) {
 function subscriptionKey(subscriptionId) {
   return `sub:${subscriptionId}`;
 }
+function userTierKey(userId) {
+  return `tier:user:${userId}`;
+}
+const PLANS_KEY = "plans:all";
 
 // Ingest hot path: POST /webhooks/:token looks up the webhook by token.
 // Loader should return the webhook row or null. Both active + disabled rows
@@ -213,6 +219,22 @@ async function getWebhookRow(env, ctx, webhookId, loader) {
 async function getSubscription(env, ctx, subscriptionId, loader) {
   const { subscriptionTtlMs, negativeTtlMs } = ttls(env);
   return getOrLoad(env, ctx, subscriptionKey(subscriptionId), subscriptionTtlMs, loader, { negativeTtlMs });
+}
+
+// Owner tier for ingest routing + TPS. Loader returns
+// { plan, dedicated_queue, tps_override } or null. Cached briefly so plan
+// edits (Admin API) propagate within TIER_CACHE_TTL_SECONDS.
+async function getUserTier(env, ctx, userId, loader) {
+  const { tierTtlMs, negativeTtlMs } = ttls(env);
+  return getOrLoad(env, ctx, userTierKey(userId), tierTtlMs, loader, { negativeTtlMs });
+}
+
+// All rows of the plans table as { [plan]: { tps_limit, burst_limit,
+// window_seconds } }. Loader reads D1; callers fall back to env/defaults
+// when the table is missing (pre-migration DBs).
+async function getPlanConfig(env, ctx, loader) {
+  const { planTtlMs } = ttls(env);
+  return getOrLoad(env, ctx, PLANS_KEY, planTtlMs, loader);
 }
 
 function invalidateWebhook(env, ctx, { id, token } = {}) {
@@ -240,6 +262,17 @@ function invalidateSubscription(env, ctx, subscriptionId) {
   kvDelete(env, ctx, subscriptionKey(subscriptionId));
 }
 
+function invalidateUserTier(env, ctx, userId) {
+  if (userId == null) return;
+  memoryDelete(userTierKey(userId));
+  kvDelete(env, ctx, userTierKey(userId));
+}
+
+function invalidatePlans(env, ctx) {
+  memoryDelete(PLANS_KEY);
+  kvDelete(env, ctx, PLANS_KEY);
+}
+
 function invalidateAllSubscriptions(env, ctx, webhookId) {
   // We don't track sub ids per webhook in the cache index, so drop the
   // whole subscription prefix on bulk rewrites (saveSubscriptions). These
@@ -256,13 +289,17 @@ function clearHotCache() {
 
 export {
   getOrLoad,
+  getPlanConfig,
   getRouteConfig,
   getSubscription,
+  getUserTier,
   getWebhookByToken,
   getWebhookRow,
   invalidateAllSubscriptions,
+  invalidatePlans,
   invalidateRouteConfig,
   invalidateSubscription,
+  invalidateUserTier,
   invalidateWebhook,
   clearHotCache,
 };

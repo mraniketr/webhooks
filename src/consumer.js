@@ -1,20 +1,16 @@
-import { processAnalyticsBatch, processDelivery, processEvent } from "./processing.js";
+import { processAnalyticsBatch } from "./analytics.js";
+import { processEvent } from "./router.js";
+import { processDelivery } from "./delivery.js";
+import { analyticsDelay, deliveryDelay, eventDelay } from "./processing.js";
 
-// Consumer worker for all three queues.
+// Legacy consumer worker — DRAIN ONLY.
 //
-// - `hooklane-events` (main queue): run the single pre-action (setting the
-//   `pre` key-value object), fan out one task per subscription into
-//   `hooklane-deliveries`, then ack. No D1 writes here — status goes to
-//   structured logs, counts go to the analytics queue.
-//   Delivery failures never block this queue.
-// - `hooklane-deliveries` (task queue): forward one event to one URL with
-//   its own retry budget. Outcome is a structured log (with http_status)
-//   plus an analytics increment — no per-delivery D1 row.
-// - `hooklane-analytics` (counts queue): the ONLY aggregate writer.
-//   Collapses each batch into one UPSERT per (webhook, day).
-//
-// This worker has no HTTP routes; `fetch` only exists so direct hits
-// return a clear 404 instead of a missing-handler error.
+// This shim keeps the old single-worker deployment (`wrangler.consumer.jsonc`,
+// consuming the legacy `hooklane-events` / `hooklane-deliveries` /
+// `hooklane-analytics` queues) runnable while the old delivery queue drains.
+// Each branch delegates to the handler owned by its own module — no queue
+// logic lives here. Do not add new behavior; deploy the router + delivery
+// workers for all live traffic.
 
 export default {
   async fetch() {
@@ -35,17 +31,25 @@ export default {
         console.error(
           JSON.stringify({
             level: "error",
-            msg: "analytics batch failed, retrying",
+            msg: "analytics batch failed, retrying with backoff",
             queue: batch.queue,
             error: error?.message || String(error),
           })
         );
-        for (const message of batch.messages) message.retry();
+        const maxAttempts = Math.max(...batch.messages.map((m) => Number(m.attempts) || 1), 1);
+        const delaySeconds = analyticsDelay(maxAttempts);
+        try {
+          batch.retryAll({ delaySeconds });
+        } catch {
+          for (const message of batch.messages) message.retry({ delaySeconds });
+        }
       }
       return;
     }
 
-    const handler = batch.queue.endsWith("hooklane-deliveries") ? processDelivery : processEvent;
+    const isDelivery = batch.queue.includes("hooklane-deliveries");
+    const handler = isDelivery ? processDelivery : processEvent;
+    const delayFor = isDelivery ? deliveryDelay : eventDelay;
     // Run messages in a batch concurrently — sequential awaits would stack
     // per-message latency (notably the outbound fetch in processDelivery).
     await Promise.all(batch.messages.map(async (message) => {
@@ -53,16 +57,23 @@ export default {
         await handler(message.body, env, ctx);
         message.ack();
       } catch (error) {
+        const delaySeconds = delayFor(message.attempts);
         console.error(
           JSON.stringify({
             level: "error",
-            msg: "queue message failed, retrying",
+            msg: "queue message failed, retrying with backoff",
             queue: batch.queue,
+            attempt: Number(message.attempts) || 1,
+            delaySeconds,
             body: message.body,
             error: error?.message || String(error),
           })
         );
-        message.retry();
+        try {
+          message.retry({ delaySeconds });
+        } catch {
+          message.retry();
+        }
       }
     }));
   },

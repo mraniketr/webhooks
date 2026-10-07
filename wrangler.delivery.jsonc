@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "webhooks-consumer",
-  "main": "src/consumer.js",
+  "name": "webhooks-delivery",
+  "main": "src/delivery.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -16,31 +16,27 @@
       "id": "f0e6c89803434a74bb8216e2ecb99500"
     }
   ],
+  // Delivery worker for the shared + pro tiers (one deployment, per-queue
+  // tuning below). Dedicated customers get their own deployment stamped from
+  // wrangler.delivery-dedicated.template.jsonc. Never attach hooklane-events
+  // or hooklane-analytics here — those belong to the router worker.
   "queues": {
     "producers": [
-      { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" },
       { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
     ],
     "consumers": [
       {
-        "queue": "hooklane-events",
-        "max_batch_size": 10,
-        "max_batch_timeout": 0.1,
-        "max_retries": 8,
-        "retry_delay": 10
-      },
-      {
-        "queue": "hooklane-deliveries",
+        "queue": "hooklane-deliveries-shared",
         "max_batch_size": 10,
         "max_batch_timeout": 0.1,
         "max_retries": 10,
         "retry_delay": 60
       },
       {
-        "queue": "hooklane-analytics",
-        "max_batch_size": 50,
-        "max_batch_timeout": 10,
-        "max_retries": 8,
+        "queue": "hooklane-deliveries-pro",
+        "max_batch_size": 20,
+        "max_batch_timeout": 0.1,
+        "max_retries": 10,
         "retry_delay": 30
       }
     ]

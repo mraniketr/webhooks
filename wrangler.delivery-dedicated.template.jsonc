@@ -1,7 +1,11 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "webhooks-consumer",
-  "main": "src/consumer.js",
+  // Template for per-customer dedicated delivery workers.
+  // Provision with: npm run provision:dedicated -- <slug>
+  // (see scripts/provision-dedicated.sh), which copies this file to
+  // wrangler.delivery-dedicated.<slug>.jsonc replacing __SLUG__/__WORKER_NAME__.
+  "name": "__WORKER_NAME__",
+  "main": "src/delivery.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -16,31 +20,17 @@
       "id": "f0e6c89803434a74bb8216e2ecb99500"
     }
   ],
+  // Tune max_batch_size / retry_delay per customer contract before deploy.
   "queues": {
     "producers": [
-      { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" },
       { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
     ],
     "consumers": [
       {
-        "queue": "hooklane-events",
-        "max_batch_size": 10,
-        "max_batch_timeout": 0.1,
-        "max_retries": 8,
-        "retry_delay": 10
-      },
-      {
-        "queue": "hooklane-deliveries",
-        "max_batch_size": 10,
+        "queue": "hooklane-deliveries-ded-__SLUG__",
+        "max_batch_size": 20,
         "max_batch_timeout": 0.1,
         "max_retries": 10,
-        "retry_delay": 60
-      },
-      {
-        "queue": "hooklane-analytics",
-        "max_batch_size": 50,
-        "max_batch_timeout": 10,
-        "max_retries": 8,
         "retry_delay": 30
       }
     ]

@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "webhooks",
+  "name": "dev-webhooks",
   "main": "src/index.js",
   "compatibility_date": "2026-10-02",
   "assets": {
@@ -11,29 +11,29 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "hooklane-db",
-      "database_id": "7d4b3e40-3ba2-4d52-84f5-fa24329102e0"
+      "database_name": "dev-hooklane-db",
+      "database_id": "42bfc77c-4dbe-46fb-9708-4c63ae4f8c57"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "WEBHOOK_CACHE",
-      "id": "f0e6c89803434a74bb8216e2ecb99500"
+      "id": "e1900d49f76c4329b87fc652261e4413"
     }
   ],
   "queues": {
     "producers": [
-      { "binding": "WEBHOOK_QUEUE", "queue": "hooklane-events" },
-      { "binding": "EVENT_QUEUE", "queue": "hooklane-events" },
-      { "binding": "DELIVERY_SHARED", "queue": "hooklane-deliveries-shared" },
-      { "binding": "DELIVERY_PRO", "queue": "hooklane-deliveries-pro" },
-      { "binding": "ANALYTICS_QUEUE", "queue": "hooklane-analytics" }
+      { "binding": "WEBHOOK_QUEUE", "queue": "dev-hooklane-events" },
+      { "binding": "EVENT_QUEUE", "queue": "dev-hooklane-events" },
+      { "binding": "DELIVERY_SHARED", "queue": "dev-hooklane-deliveries-shared" },
+      { "binding": "DELIVERY_PRO", "queue": "dev-hooklane-deliveries-pro" },
+      { "binding": "ANALYTICS_QUEUE", "queue": "dev-hooklane-analytics" }
     ]
   },
   "ratelimits": [
     {
       "name": "USER_RATE_LIMITER",
-      "namespace_id": "1001",
+      "namespace_id": "1002",
       "simple": { "limit": 60, "period": 60 }
     }
   ],
