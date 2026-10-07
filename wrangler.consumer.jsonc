@@ -16,6 +16,10 @@
       "id": "f0e6c89803434a74bb8216e2ecb99500"
     }
   ],
+  // DRAIN ONLY: consumes the legacy hooklane-deliveries queue until it
+  // empties, then delete this worker and the queue. hooklane-events and
+  // hooklane-analytics belong to the router worker (wrangler.router.jsonc)
+  // — never re-attach them here (one consumer per queue).
   "queues": {
     "producers": [
       { "binding": "DELIVERY_QUEUE", "queue": "hooklane-deliveries" },
@@ -23,25 +27,11 @@
     ],
     "consumers": [
       {
-        "queue": "hooklane-events",
-        "max_batch_size": 10,
-        "max_batch_timeout": 0.1,
-        "max_retries": 8,
-        "retry_delay": 10
-      },
-      {
         "queue": "hooklane-deliveries",
         "max_batch_size": 10,
         "max_batch_timeout": 0.1,
         "max_retries": 10,
         "retry_delay": 60
-      },
-      {
-        "queue": "hooklane-analytics",
-        "max_batch_size": 50,
-        "max_batch_timeout": 10,
-        "max_retries": 8,
-        "retry_delay": 30
       }
     ]
   },
