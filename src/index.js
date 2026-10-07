@@ -977,20 +977,10 @@ export default {
           }
           await ensureUserTierColumns(env);
           if (plan === "dedicated") {
-            // Self-serve dedicated: allowed, no payment. A dedicated queue is
-            // provisioned by an admin afterwards; until then deliveries fall
-            // back to the shared queue (see router fallback) so nothing breaks.
-            await env.DB.prepare("UPDATE users SET plan='dedicated' WHERE id=?").bind(user.id).run();
-            invalidateUserTier(env, ctx, user.id);
-            console.log(JSON.stringify({ level: "info", msg: "user plan self-selected", userId: user.id, plan, dedicatedQueue: user.dedicated_queue || null }));
-            const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(user.id).first().catch(() => null);
-            const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
-            invalidatePlans(env, ctx);
-            return apiJson(user, env, ttlMs, {
-              user: updated ? sanitizeUser(updated) : { id: user.id, plan },
-              plan, limits: effectiveTierLimit(planCfg, { plan, tps_override: null }),
-              notice: updated?.dedicated_queue ? undefined : "Dedicated queue not provisioned yet — deliveries use the shared queue until an admin provisions one.",
-            });
+            // Dedicated is sales-provisioned (Plans page shows Contact sales).
+            // Self-serve selection is disabled; admins assign it via
+            // PUT /api/admin/users/:id/plan with a dedicated_queue.
+            return apiJson(user, env, ttlMs, { error: "Dedicated is provisioned by our team — contact im.aniket.rai@gmail.com to move to Dedicated." }, 403);
           }
           // Downgrade guard: dropping to a plan with lower quotas must not
           // strand the user over quota — block with counts, don't auto-delete.

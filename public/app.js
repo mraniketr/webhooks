@@ -643,13 +643,22 @@ async function loadPlans() {
         + `<li>◌ <span><b>Webhooks:</b> ${esc(fmtQuota(p.max_webhooks))}</span></li>`
         + `<li>🔗 <span><b>Subscriptions / webhook:</b> ${esc(fmtQuota(p.max_subs_per_webhook))}</span></li>`
         + `</ul>`
-        + (p.plan === 'dedicated' && !isCurrent ? '<div class="hint">Dedicated uses isolated queues — provisioned by an admin after you select it. Deliveries fall back to shared until then.</div>' : '');
-      const btn = document.createElement('button');
-      btn.className = isCurrent ? 'ghost full' : 'primary full';
-      btn.textContent = isCurrent ? 'Current plan' : `Select ${p.plan}`;
-      btn.disabled = isCurrent;
-      if (!isCurrent) btn.onclick = () => selectPlan(p.plan, btn);
-      card.append(btn);
+        + (p.plan === 'dedicated' && !isCurrent ? '<div class="hint">Dedicated uses isolated queues — talk to us and we will provision one for you.</div>' : '');
+      if (p.plan === 'dedicated' && !isCurrent) {
+        const mail = document.createElement('a');
+        mail.className = 'primary full';
+        mail.style.cssText = 'display:flex;justify-content:center;text-decoration:none';
+        mail.href = 'mailto:im.aniket.rai@gmail.com?subject=' + encodeURIComponent('Dedicated plan enquiry') + '&body=' + encodeURIComponent('Hi, I would like to move to the Dedicated plan.\n\nWorkspace email: ' + (user?.email || ''));
+        mail.textContent = 'Contact sales';
+        card.append(mail);
+      } else {
+        const btn = document.createElement('button');
+        btn.className = isCurrent ? 'ghost full' : 'primary full';
+        btn.textContent = isCurrent ? 'Current plan' : `Select ${p.plan}`;
+        btn.disabled = isCurrent;
+        if (!isCurrent) btn.onclick = () => selectPlan(p.plan, btn);
+        card.append(btn);
+      }
       grid.append(card);
     });
   } catch (err) {
