@@ -509,23 +509,32 @@ async function rateLimit(request, env, userId) {
   }
 }
 
-// ---- Tiered queues: plan resolution + configurable per-tier TPS ----
+// ---- Tiered plans: free / pro / dedicated (plan resolution + limits) ----
 // Plans live in D1 (editable via Admin API, cached ~15s). The Workers
 // Rate-Limit binding can't vary per tier (limit is fixed in wrangler.jsonc),
 // so tier TPS is enforced here with a best-effort fixed-window counter in
 // KV (cross-isolate) with an in-memory per-isolate fallback. Over-admission
 // under races is possible; the binding above stays as the hard guardrail.
+//
+// Canonical plans: free, pro, dedicated. 'shared' is a legacy alias for
+// 'pro' (DB rows / API callers from the brief rename) — normalizePlan maps it.
+// NULL limit = unlimited (dedicated). All values are DB-configurable; the
+// FALLBACK below only applies pre-migration / when D1 is unreachable.
+// "1 TPS" is stored as tps_limit=60 per window_seconds=60 (≈1/sec sustained);
+// "100 TPS" as tps_limit=6000 per window_seconds=60.
 const VALID_PLANS = new Set(["free", "pro", "dedicated"]);
+const LEGACY_PLAN_ALIASES = { shared: "pro" };
 const FALLBACK_PLAN_LIMITS = {
-  free: { tps_limit: 10, burst_limit: 20, window_seconds: 60 },
-  pro: { tps_limit: 100, burst_limit: 200, window_seconds: 60 },
-  dedicated: { tps_limit: 1000, burst_limit: 2000, window_seconds: 60 },
+  free: { tps_limit: 60, burst_limit: 120, window_seconds: 60, daily_limit: 1000, max_webhooks: 2, max_subs_per_webhook: 3, price_cents: 0, price_display: "$0", infra: "shared", description: "Shared infra · for trying things out" },
+  pro: { tps_limit: 6000, burst_limit: 12000, window_seconds: 60, daily_limit: 10000, max_webhooks: 10, max_subs_per_webhook: 10, price_cents: 1900, price_display: "$19/mo", infra: "shared", description: "Shared infra · higher throughput" },
+  dedicated: { tps_limit: 100000, burst_limit: 200000, window_seconds: 60, daily_limit: null, max_webhooks: null, max_subs_per_webhook: null, price_cents: 0, price_display: "Custom", infra: "dedicated", description: "Isolated queues · no limits" },
 };
 const DEDICATED_QUEUE_RE = /^hooklane-deliveries-ded-[a-z0-9][a-z0-9-]{0,59}$/;
 const MEMORY_RL_KEY = "__hooklane_tier_rl";
 
 function normalizePlan(v) {
   const s = String(v || "").trim().toLowerCase();
+  if (LEGACY_PLAN_ALIASES[s]) return LEGACY_PLAN_ALIASES[s];
   return VALID_PLANS.has(s) ? s : "free";
 }
 
@@ -548,32 +557,106 @@ async function ensureUserTierColumns(env) {
 async function ensurePlansTable(env) {
   try {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS plans (
-      plan TEXT PRIMARY KEY CHECK(plan IN ('free','pro','dedicated')),
+      plan TEXT PRIMARY KEY CHECK(plan IN ('free','shared','dedicated','pro')),
       tps_limit INTEGER NOT NULL,
       burst_limit INTEGER NOT NULL,
       window_seconds INTEGER NOT NULL DEFAULT 60,
+      daily_limit INTEGER,
+      max_webhooks INTEGER,
+      max_subs_per_webhook INTEGER,
+      price_cents INTEGER NOT NULL DEFAULT 0,
+      price_display TEXT NOT NULL DEFAULT '$0',
+      infra TEXT NOT NULL DEFAULT 'shared',
+      description TEXT,
       updated_at TEXT NOT NULL
     )`).run();
+    // Best-effort ALTERs for DBs created with the old 4-column schema.
+    try {
+      const cols = await env.DB.prepare("PRAGMA table_info(plans)").all();
+      const names = new Set((cols.results || []).map((c) => c.name));
+      if (!names.has("daily_limit")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN daily_limit INTEGER").run();
+      if (!names.has("max_webhooks")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN max_webhooks INTEGER").run();
+      if (!names.has("max_subs_per_webhook")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN max_subs_per_webhook INTEGER").run();
+      if (!names.has("price_cents")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN price_cents INTEGER NOT NULL DEFAULT 0").run();
+      if (!names.has("price_display")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN price_display TEXT NOT NULL DEFAULT '$0'").run();
+      if (!names.has("infra")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN infra TEXT NOT NULL DEFAULT 'shared'").run();
+      if (!names.has("description")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN description TEXT").run();
+    } catch { /* old SQLite without support — loader falls back per-row */ }
     const ts = now();
+    const fb = FALLBACK_PLAN_LIMITS;
     await env.DB.batch([
-      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('free',10,20,60,?)").bind(ts),
-      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('pro',100,200,60,?)").bind(ts),
-      env.DB.prepare("INSERT OR IGNORE INTO plans (plan,tps_limit,burst_limit,window_seconds,updated_at) VALUES ('dedicated',1000,2000,60,?)").bind(ts),
+      env.DB.prepare(`INSERT OR IGNORE INTO plans
+        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
+        VALUES ('free',?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(fb.free.tps_limit, fb.free.burst_limit, fb.free.window_seconds, fb.free.daily_limit, fb.free.max_webhooks, fb.free.max_subs_per_webhook, fb.free.price_cents, fb.free.price_display, fb.free.infra, fb.free.description, ts),
+      env.DB.prepare(`INSERT OR IGNORE INTO plans
+        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
+        VALUES ('pro',?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(fb.pro.tps_limit, fb.pro.burst_limit, fb.pro.window_seconds, fb.pro.daily_limit, fb.pro.max_webhooks, fb.pro.max_subs_per_webhook, fb.pro.price_cents, fb.pro.price_display, fb.pro.infra, fb.pro.description, ts),
+      env.DB.prepare(`INSERT OR IGNORE INTO plans
+        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
+        VALUES ('dedicated',?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(fb.dedicated.tps_limit, fb.dedicated.burst_limit, fb.dedicated.window_seconds, fb.dedicated.daily_limit, fb.dedicated.max_webhooks, fb.dedicated.max_subs_per_webhook, fb.dedicated.price_cents, fb.dedicated.price_display, fb.dedicated.infra, fb.dedicated.description, ts),
     ]);
+    // Migrate any legacy 'shared' plan row back to 'pro'.
+    try {
+      const shared = await env.DB.prepare("SELECT * FROM plans WHERE plan='shared'").first().catch(() => null);
+      if (shared) {
+        const pro = await env.DB.prepare("SELECT * FROM plans WHERE plan='pro'").first().catch(() => null);
+        if (!pro) {
+          await env.DB.prepare("UPDATE plans SET plan='pro' WHERE plan='shared'").run().catch(() => {});
+        } else {
+          await env.DB.prepare("DELETE FROM plans WHERE plan='shared'").run().catch(() => {});
+        }
+        await env.DB.prepare("UPDATE users SET plan='pro' WHERE plan='shared'").run().catch(() => {});
+      }
+    } catch { /* ignore */ }
   } catch { /* ignore — callers fall back to defaults */ }
+}
+
+function nullableLimit(v) {
+  // NULL/undefined/empty = unlimited. 0 and negatives are treated as unlimited
+  // too (a zero quota would otherwise brick the plan).
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
 }
 
 async function loadPlanConfig(env) {
   await ensurePlansTable(env);
   try {
-    const rows = await env.DB.prepare("SELECT plan,tps_limit,burst_limit,window_seconds FROM plans").all();
+    const rows = await env.DB.prepare("SELECT * FROM plans").all();
     const out = {};
     for (const r of rows.results || []) {
       const plan = normalizePlan(r.plan);
+      if (!FALLBACK_PLAN_LIMITS[plan]) continue; // skip unknown plan rows
+      const fb = FALLBACK_PLAN_LIMITS[plan];
+      // NULL in DB = unlimited (dedicated). Missing column (pre-migration
+      // row shape) or garbage = plan fallback.
+      const quotaOrFallback = (v, fallback) => {
+        if (v === null || v === undefined) {
+          // Column present with NULL = explicit unlimited; column absent
+          // entirely (undefined) = fall back.
+          return v === null ? null : fallback;
+        }
+        if (v === "") return fallback;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return fallback;
+        if (n <= 0) return null; // 0/negative quota would brick the plan → unlimited
+        return Math.floor(n);
+      };
       out[plan] = {
-        tps_limit: Math.max(1, Number(r.tps_limit) || FALLBACK_PLAN_LIMITS[plan].tps_limit),
-        burst_limit: Math.max(1, Number(r.burst_limit) || FALLBACK_PLAN_LIMITS[plan].burst_limit),
-        window_seconds: Math.min(3600, Math.max(10, Number(r.window_seconds) || 60)),
+        tps_limit: Math.max(1, Number(r.tps_limit) || fb.tps_limit),
+        burst_limit: Math.max(1, Number(r.burst_limit) || fb.burst_limit),
+        window_seconds: Math.min(3600, Math.max(1, Number(r.window_seconds) || 60)),
+        daily_limit: quotaOrFallback(r.daily_limit, fb.daily_limit),
+        max_webhooks: quotaOrFallback(r.max_webhooks, fb.max_webhooks),
+        max_subs_per_webhook: quotaOrFallback(r.max_subs_per_webhook, fb.max_subs_per_webhook),
+        price_cents: Number(r.price_cents ?? fb.price_cents) || 0,
+        price_display: r.price_display ?? fb.price_display,
+        infra: r.infra || fb.infra,
+        description: r.description ?? fb.description ?? null,
       };
     }
     return { ...structuredFallbackPlans(), ...out };
@@ -595,8 +678,45 @@ function effectiveTierLimit(planCfg, tierRow) {
     tps_limit: override || cfg.tps_limit,
     burst_limit: Math.max(override || cfg.tps_limit, cfg.burst_limit),
     window_seconds: cfg.window_seconds,
+    daily_limit: cfg.daily_limit ?? null,
+    max_webhooks: cfg.max_webhooks ?? null,
+    max_subs_per_webhook: cfg.max_subs_per_webhook ?? null,
+    price_cents: cfg.price_cents ?? 0,
+    price_display: cfg.price_display ?? "$0",
+    infra: cfg.infra || "shared",
+    description: cfg.description ?? null,
     overridden: override != null,
   };
+}
+
+// Serialize a plan row for API responses (null = unlimited).
+function planView(plan, cfg) {
+  return { plan, ...(cfg || FALLBACK_PLAN_LIMITS[plan] || FALLBACK_PLAN_LIMITS.free) };
+}
+
+function utcDayString(d = new Date()) {
+  return d.toISOString().slice(0, 10);
+}
+
+async function kvRead(env, key) {
+  try {
+    const kv = env?.WEBHOOK_CACHE;
+    if (!kv || typeof kv.get !== "function") return null;
+    const raw = await kv.get(key, "text");
+    if (raw == null) return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserDailyUsage(env, userId) {
+  const count = await kvRead(env, `rl:daily:${userId}:${utcDayString()}`);
+  if (count != null) return count;
+  // Memory fallback mirrors the KV counter for single-isolate dev.
+  const m = memoryRl().get(`rl:daily:${userId}:${utcDayString()}`);
+  return m ? m.count : 0;
 }
 
 async function loadUserTier(env, userId) {
@@ -663,7 +783,42 @@ async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
   if (bcount > burstCap) {
     return { allowed: false, limits, count: bcount, retryAfter: burstWindow, reason: "burst" };
   }
-  return { allowed: true, limits, count, remaining: Math.max(0, limits.tps_limit - count) };
+  // Daily gate: calendar-day (UTC) cap per user. NULL = unlimited.
+  // Counted only for events that passed the TPS/burst gates, so rejected
+  // bursts don't burn the daily quota.
+  let dailyCount = 0;
+  if (limits.daily_limit != null) {
+    const day = utcDayString();
+    const dailyKey = `rl:daily:${userId}:${day}`;
+    let d = await kvRlIncrement(env, dailyKey, 86400);
+    if (d == null) d = memoryRlIncrement(dailyKey, 86400);
+    dailyCount = d;
+    if (d > limits.daily_limit) {
+      const secsLeft = Math.max(1, Math.ceil((new Date(`${day}T24:00:00Z`).getTime() - Date.now()) / 1000));
+      return { allowed: false, limits, count: d, dailyCount: d, retryAfter: Math.min(secsLeft, 86400), reason: "daily" };
+    }
+  } else {
+    dailyCount = await getUserDailyUsage(env, userId).catch(() => 0);
+  }
+  return { allowed: true, limits, count, dailyCount, remaining: Math.max(0, limits.tps_limit - count) };
+}
+
+async function countUserWebhooks(env, userId) {
+  try {
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM webhooks WHERE user_id=?").bind(userId).first();
+    return Number(row?.n ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function countWebhookSubscriptions(env, webhookId) {
+  try {
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE webhook_id=?").bind(webhookId).first();
+    return Number(row?.n ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 export default {
@@ -786,7 +941,82 @@ export default {
           const limits = effectiveTierLimit(planCfg, { plan, tps_override: user.tps_override != null ? Number(user.tps_override) : null });
           return apiJson(user, env, ttlMs, { user: sanitizeUser(user), plan,
             rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD },
-            tierRateLimit: { tps: limits.tps_limit, burst: limits.burst_limit, windowSeconds: limits.window_seconds, overridden: limits.overridden } });
+            tierRateLimit: { tps: limits.tps_limit, burst: limits.burst_limit, windowSeconds: limits.window_seconds, overridden: limits.overridden },
+            limits });
+        }
+
+        // ---- Self-serve plans: list + select (no payment — dummy pricing) ----
+        if (request.method === "GET" && p === "/api/plans") {
+          const plan = normalizePlan(user.plan);
+          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const [webhookCount, dailyUsed] = await Promise.all([
+            countUserWebhooks(env, user.id),
+            getUserDailyUsage(env, user.id).catch(() => 0),
+          ]);
+          return apiJson(user, env, ttlMs, {
+            currentPlan: plan,
+            usage: { webhooks: webhookCount, dailyUsed, day: utcDayString() },
+            plans: ["free", "pro", "dedicated"].map((name) => planView(name, planCfg[name])),
+          });
+        }
+
+        if ((request.method === "PUT" || request.method === "POST") && (p === "/api/plan" || p === "/api/me/plan")) {
+          const b = await readJson(request);
+          if (b.plan === undefined || b.plan === null || String(b.plan).trim() === "") {
+            return apiJson(user, env, ttlMs, { error: "plan is required (free, pro or dedicated)" }, 400);
+          }
+          const raw = String(b.plan).trim().toLowerCase();
+          if (!VALID_PLANS.has(raw) && !LEGACY_PLAN_ALIASES[raw]) {
+              return apiJson(user, env, ttlMs, { error: "plan must be free, pro or dedicated" }, 400);
+          }
+          const plan = normalizePlan(raw);
+          const current = normalizePlan(user.plan);
+          if (plan === current) {
+            const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            return apiJson(user, env, ttlMs, { user: sanitizeUser({ ...user, plan }), plan, limits: effectiveTierLimit(planCfg, { plan, tps_override: null }), unchanged: true });
+          }
+          await ensureUserTierColumns(env);
+          if (plan === "dedicated") {
+            // Self-serve dedicated: allowed, no payment. A dedicated queue is
+            // provisioned by an admin afterwards; until then deliveries fall
+            // back to the shared queue (see router fallback) so nothing breaks.
+            await env.DB.prepare("UPDATE users SET plan='dedicated' WHERE id=?").bind(user.id).run();
+            invalidateUserTier(env, ctx, user.id);
+            console.log(JSON.stringify({ level: "info", msg: "user plan self-selected", userId: user.id, plan, dedicatedQueue: user.dedicated_queue || null }));
+            const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(user.id).first().catch(() => null);
+            const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            invalidatePlans(env, ctx);
+            return apiJson(user, env, ttlMs, {
+              user: updated ? sanitizeUser(updated) : { id: user.id, plan },
+              plan, limits: effectiveTierLimit(planCfg, { plan, tps_override: null }),
+              notice: updated?.dedicated_queue ? undefined : "Dedicated queue not provisioned yet — deliveries use the shared queue until an admin provisions one.",
+            });
+          }
+          // Downgrade guard: dropping to a plan with lower quotas must not
+          // strand the user over quota — block with counts, don't auto-delete.
+          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const next = effectiveTierLimit(planCfg, { plan, tps_override: null });
+          if (next.max_webhooks != null) {
+            const n = await countUserWebhooks(env, user.id);
+            if (n > next.max_webhooks) {
+              return apiJson(user, env, ttlMs, { error: `This plan allows ${next.max_webhooks} webhooks, but you have ${n}. Delete ${n - next.max_webhooks} webhook(s) first.` }, 403);
+            }
+          }
+          if (next.max_subs_per_webhook != null) {
+            const rows = await env.DB.prepare("SELECT id FROM webhooks WHERE user_id=?").bind(user.id).all().catch(() => ({ results: [] }));
+            for (const w of rows.results || []) {
+              const n = await countWebhookSubscriptions(env, w.id);
+              if (n > next.max_subs_per_webhook) {
+                return apiJson(user, env, ttlMs, { error: `This plan allows ${next.max_subs_per_webhook} subscriptions per webhook (webhook ${w.id} has ${n}). Remove ${n - next.max_subs_per_webhook} subscription(s) first.` }, 403);
+              }
+            }
+          }
+          await env.DB.prepare("UPDATE users SET plan=? WHERE id=?").bind(plan, user.id).run();
+          invalidateUserTier(env, ctx, user.id);
+          console.log(JSON.stringify({ level: "info", msg: "user plan self-selected", userId: user.id, plan }));
+          const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(user.id).first().catch(() => null);
+          return apiJson(user, env, ttlMs, { user: updated ? sanitizeUser(updated) : { id: user.id, plan }, plan,
+            limits: effectiveTierLimit(planCfg, { plan, tps_override: null }) });
         }
 
         if (request.method === "GET" && p === "/api/dashboard") {
@@ -829,6 +1059,19 @@ export default {
 
         if (request.method === "POST" && p === "/api/webhooks") {
           const b = await readJson(request);
+          // Plan quota: max webhooks per user (NULL = unlimited).
+          const planCfgForCreate = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const createLimits = effectiveTierLimit(planCfgForCreate, { plan: normalizePlan(user.plan), tps_override: user.tps_override != null ? Number(user.tps_override) : null });
+          if (createLimits.max_webhooks != null) {
+            const n = await countUserWebhooks(env, user.id);
+            if (n >= createLimits.max_webhooks) {
+              return apiJson(user, env, ttlMs, { error: `Plan limit reached: ${createLimits.max_webhooks} webhooks on the ${normalizePlan(user.plan)} plan. Upgrade on the Plans page for more.`, plan: normalizePlan(user.plan), limit: createLimits.max_webhooks }, 403);
+            }
+          }
+          const subsPre = normalizeSubscriptions(b.subscriptions);
+          if (createLimits.max_subs_per_webhook != null && subsPre && subsPre.length > createLimits.max_subs_per_webhook) {
+            return apiJson(user, env, ttlMs, { error: `Plan limit reached: ${createLimits.max_subs_per_webhook} subscriptions per webhook on the ${normalizePlan(user.plan)} plan.`, plan: normalizePlan(user.plan), limit: createLimits.max_subs_per_webhook }, 403);
+          }
           const name = String(b.name || "Untitled webhook").trim() || "Untitled webhook";
           const token = randomToken();
           const created = now();
@@ -845,7 +1088,7 @@ export default {
           const wid = hook.meta.last_row_id;
           const actions = normalizeActions(b.actions) || [];
           await saveActions(env, ctx, wid, actions);
-          const subs = normalizeSubscriptions(b.subscriptions) || [];
+          const subs = subsPre || [];
           await saveSubscriptions(env, ctx, wid, subs);
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
@@ -882,7 +1125,14 @@ export default {
           const actions = normalizeActions(b.actions);
           if (actions) await saveActions(env, ctx, wid, actions);
           const subs = normalizeSubscriptions(b.subscriptions);
-          if (subs) await mergeSubscriptions(env, ctx, wid, subs);
+          if (subs) {
+            const planCfgForUpdate = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            const updateLimits = effectiveTierLimit(planCfgForUpdate, { plan: normalizePlan(user.plan), tps_override: user.tps_override != null ? Number(user.tps_override) : null });
+            if (updateLimits.max_subs_per_webhook != null && subs.length > updateLimits.max_subs_per_webhook) {
+              return apiJson(user, env, ttlMs, { error: `Plan limit reached: ${updateLimits.max_subs_per_webhook} subscriptions per webhook on the ${normalizePlan(user.plan)} plan.`, plan: normalizePlan(user.plan), limit: updateLimits.max_subs_per_webhook }, 403);
+            }
+            await mergeSubscriptions(env, ctx, wid, subs);
+          }
           const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
           const rel = await webhookRelations(env, wid);
           return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
@@ -1002,37 +1252,82 @@ export default {
           if (request.method === "GET" && p === "/api/admin/plans") {
             await ensurePlansTable(env);
             const cfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
-            return apiJson(user, env, ttlMs, { plans: ["free", "pro", "dedicated"].map((plan) => ({ plan, ...cfg[plan] })) });
+            return apiJson(user, env, ttlMs, { plans: ["free", "pro", "dedicated"].map((plan) => planView(plan, cfg[plan])) });
           }
 
-          const planMatch = p.match(/^\/api\/admin\/plans\/(free|pro|dedicated)$/);
+          const planMatch = p.match(/^\/api\/admin\/plans\/(free|shared|dedicated|pro)$/);
           if ((request.method === "PUT" || request.method === "PATCH") && planMatch) {
-            const plan = planMatch[1];
+            const plan = normalizePlan(planMatch[1]);
             const b = await readJson(request);
             const tps = b.tps_limit ?? b.tps;
             const burst = b.burst_limit ?? b.burst;
             const win = b.window_seconds ?? b.windowSeconds ?? b.window;
+            // Quota fields: null/"" = unlimited (dedicated). Numbers are caps.
+            const daily = b.daily_limit ?? b.dailyLimit ?? b.per_day ?? b.daily;
+            const maxWh = b.max_webhooks ?? b.maxWebhooks ?? b.webhooks;
+            const maxSubs = b.max_subs_per_webhook ?? b.maxSubsPerWebhook ?? b.max_subs ?? b.subscriptions;
+            const priceCents = b.price_cents ?? b.priceCents ?? b.price;
+            const priceDisplay = b.price_display ?? b.priceDisplay;
+            const infra = b.infra;
+            const description = b.description;
             if (tps !== undefined && (!Number.isInteger(Number(tps)) || Number(tps) < 1 || Number(tps) > 100000)) {
               return apiJson(user, env, ttlMs, { error: "tps_limit must be an integer 1..100000" }, 400);
             }
             if (burst !== undefined && (!Number.isInteger(Number(burst)) || Number(burst) < 1 || Number(burst) > 200000)) {
               return apiJson(user, env, ttlMs, { error: "burst_limit must be an integer 1..200000" }, 400);
             }
-            if (win !== undefined && (!Number.isInteger(Number(win)) || Number(win) < 10 || Number(win) > 3600)) {
-              return apiJson(user, env, ttlMs, { error: "window_seconds must be an integer 10..3600" }, 400);
+            if (win !== undefined && (!Number.isInteger(Number(win)) || Number(win) < 1 || Number(win) > 3600)) {
+              return apiJson(user, env, ttlMs, { error: "window_seconds must be an integer 1..3600" }, 400);
+            }
+            const quotaField = (v, name, max) => {
+              if (v === undefined) return undefined;
+              if (v === null || v === "") return null;
+              if (!Number.isInteger(Number(v)) || Number(v) < 1 || Number(v) > max) {
+                throw Object.assign(new Error(`${name} must be an integer 1..${max} or null (unlimited)`), { status: 400 });
+              }
+              return Math.floor(Number(v));
+            };
+            let qDaily, qWh, qSubs;
+            try {
+              qDaily = quotaField(daily, "daily_limit", 100000000);
+              qWh = quotaField(maxWh, "max_webhooks", 100000);
+              qSubs = quotaField(maxSubs, "max_subs_per_webhook", 100000);
+            } catch (e) {
+              return apiJson(user, env, ttlMs, { error: e.message }, e.status || 400);
+            }
+            if (priceCents !== undefined && (!Number.isInteger(Number(priceCents)) || Number(priceCents) < 0 || Number(priceCents) > 100000000)) {
+              return apiJson(user, env, ttlMs, { error: "price_cents must be an integer 0..100000000 (dummy for now)" }, 400);
+            }
+            if (priceDisplay !== undefined && String(priceDisplay).length > 50) {
+              return apiJson(user, env, ttlMs, { error: "price_display must be ≤ 50 chars" }, 400);
+            }
+            if (infra !== undefined && !["shared", "dedicated"].includes(String(infra).trim().toLowerCase())) {
+              return apiJson(user, env, ttlMs, { error: "infra must be shared or dedicated" }, 400);
+            }
+            if (description !== undefined && String(description).length > 300) {
+              return apiJson(user, env, ttlMs, { error: "description must be ≤ 300 chars" }, 400);
             }
             await ensurePlansTable(env);
-            const current = await env.DB.prepare("SELECT tps_limit,burst_limit,window_seconds FROM plans WHERE plan=?").bind(plan).first()
+            const current = await env.DB.prepare("SELECT * FROM plans WHERE plan=?").bind(plan).first()
               .catch(() => null) || FALLBACK_PLAN_LIMITS[plan];
             const next = {
               tps_limit: tps !== undefined ? Math.floor(Number(tps)) : Number(current.tps_limit),
               burst_limit: burst !== undefined ? Math.floor(Number(burst)) : Number(current.burst_limit),
               window_seconds: win !== undefined ? Math.floor(Number(win)) : Number(current.window_seconds),
+              daily_limit: qDaily !== undefined ? qDaily : (current.daily_limit ?? FALLBACK_PLAN_LIMITS[plan].daily_limit ?? null),
+              max_webhooks: qWh !== undefined ? qWh : (current.max_webhooks ?? FALLBACK_PLAN_LIMITS[plan].max_webhooks ?? null),
+              max_subs_per_webhook: qSubs !== undefined ? qSubs : (current.max_subs_per_webhook ?? FALLBACK_PLAN_LIMITS[plan].max_subs_per_webhook ?? null),
+              price_cents: priceCents !== undefined ? Math.floor(Number(priceCents)) : Number(current.price_cents ?? 0),
+              price_display: priceDisplay !== undefined ? String(priceDisplay) : (current.price_display ?? FALLBACK_PLAN_LIMITS[plan].price_display),
+              infra: infra !== undefined ? String(infra).trim().toLowerCase() : (current.infra || FALLBACK_PLAN_LIMITS[plan].infra),
+              description: description !== undefined ? (String(description) || null) : (current.description ?? FALLBACK_PLAN_LIMITS[plan].description ?? null),
             };
-            await env.DB.prepare("UPDATE plans SET tps_limit=?, burst_limit=?, window_seconds=?, updated_at=? WHERE plan=?")
-              .bind(next.tps_limit, next.burst_limit, next.window_seconds, now(), plan).run();
+            await env.DB.prepare(`UPDATE plans SET tps_limit=?, burst_limit=?, window_seconds=?, daily_limit=?,
+              max_webhooks=?, max_subs_per_webhook=?, price_cents=?, price_display=?, infra=?, description=?, updated_at=? WHERE plan=?`)
+              .bind(next.tps_limit, next.burst_limit, next.window_seconds, next.daily_limit,
+                next.max_webhooks, next.max_subs_per_webhook, next.price_cents, next.price_display, next.infra, next.description, now(), plan).run();
             invalidatePlans(env, ctx);
-            console.log(JSON.stringify({ level: "info", msg: "plan TPS updated", plan, ...next, by: user.id }));
+            console.log(JSON.stringify({ level: "info", msg: "plan updated", plan, ...next, by: user.id }));
             return apiJson(user, env, ttlMs, { plan, ...next });
           }
 
@@ -1041,10 +1336,11 @@ export default {
             const targetId = Number(userPlanMatch[1]);
             const b = await readJson(request);
             if (b.plan === undefined) return apiJson(user, env, ttlMs, { error: "plan is required" }, 400);
-            const plan = normalizePlan(b.plan);
-            if (b.plan != null && !VALID_PLANS.has(String(b.plan).trim().toLowerCase())) {
-              return apiJson(user, env, ttlMs, { error: "plan must be free, pro or dedicated" }, 400);
+            const rawPlan = String(b.plan).trim().toLowerCase();
+            if (!VALID_PLANS.has(rawPlan) && !LEGACY_PLAN_ALIASES[rawPlan]) {
+            return apiJson(user, env, ttlMs, { error: "plan must be free, pro or dedicated" }, 400);
             }
+            const plan = normalizePlan(b.plan);
             let dedicatedQueue = b.dedicated_queue ?? b.dedicatedQueue ?? null;
             if (dedicatedQueue != null && String(dedicatedQueue).trim() !== "") {
               dedicatedQueue = String(dedicatedQueue).trim();
@@ -1131,10 +1427,13 @@ export default {
         const tier = normalizePlan(tierRow?.plan);
         const tierCheck = await tierRateLimit(env, ctx, hook.user_id, { ...tierRow, plan: tier }, planCfg);
         if (!tierCheck.allowed) {
-          return json({ error: "Rate limit exceeded", plan: tier }, 429, {
+          const isDaily = tierCheck.reason === "daily";
+          return json({ error: isDaily ? "Daily event limit exceeded" : "Rate limit exceeded", plan: tier, reason: tierCheck.reason || "tps",
+            ...(isDaily && tierCheck.limits.daily_limit != null ? { daily_limit: tierCheck.limits.daily_limit } : {}) }, 429, {
             "retry-after": String(tierCheck.retryAfter || 60),
             "x-plan": tier,
             "x-tps-limit": String(tierCheck.limits.tps_limit),
+            ...(isDaily && tierCheck.limits.daily_limit != null ? { "x-daily-limit": String(tierCheck.limits.daily_limit) } : {}),
           });
         }
         const rl = await rateLimit(request, env, hook.user_id);

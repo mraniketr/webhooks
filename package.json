@@ -17,7 +17,9 @@
     "deploy:dev:all": "wrangler deploy --config wrangler.dev.jsonc && wrangler deploy --config wrangler.dev-router.jsonc && wrangler deploy --config wrangler.dev-delivery.jsonc",
     "provision:dedicated": "bash scripts/provision-dedicated.sh",
     "db:init": "wrangler d1 execute hooklane-db --remote --file=./db/schema.sql",
-    "db:migrate:tiers": "wrangler d1 execute hooklane-db --remote --file=./db/migrate-tiered-plans.sql"
+    "db:migrate:tiers": "wrangler d1 execute hooklane-db --remote --file=./db/migrate-tiered-plans.sql",
+    "db:migrate:plans-v2": "wrangler d1 execute hooklane-db --remote --file=./db/migrate-plans-v2.sql",
+    "db:migrate:plans-v2:dev": "wrangler d1 execute dev-hooklane-db --config wrangler.dev.jsonc --remote --file=./db/migrate-plans-v2.sql"
   },
   "devDependencies": {
     "wrangler": "latest"

@@ -29,18 +29,23 @@ function dedicatedBindingKey(queueName) {
 }
 
 function resolveDeliveryQueue(env, tier, dedicatedQueue) {
-  if (tier === "pro") {
+  // 'shared' is accepted as an alias for the 'pro' tier queue (DELIVERY_PRO).
+  if (tier === "pro" || tier === "shared") {
     return env.DELIVERY_PRO || env.DELIVERY_QUEUE || null;
   }
   if (tier === "dedicated") {
     const key = dedicatedBindingKey(dedicatedQueue);
     const bound = (key && env[key]) || env.DELIVERY_DEDICATED || null;
-    if (!bound) {
-      const err = new Error(`dedicated queue not bound: ${dedicatedQueue || "(unset)"}${key ? ` (expected binding ${key})` : ""}`);
-      err.code = "DEDICATED_QUEUE_MISSING";
-      throw err;
+    if (bound) return bound;
+    if (!dedicatedQueue) {
+      // Self-serve dedicated before an admin provisions a queue: fall back
+      // to the shared queue so events still deliver (logged at the call site).
+      // A *named* but unbound queue stays a hard error (misconfiguration).
+      return env.DELIVERY_SHARED || env.DELIVERY_QUEUE || null;
     }
-    return bound;
+    const err = new Error(`dedicated queue not bound: ${dedicatedQueue || "(unset)"}${key ? ` (expected binding ${key})` : ""}`);
+    err.code = "DEDICATED_QUEUE_MISSING";
+    throw err;
   }
   return env.DELIVERY_SHARED || env.DELIVERY_QUEUE || null;
 }

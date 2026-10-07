@@ -93,6 +93,7 @@ async function hmacHex(secret, bodyText) {
 
 function normalizeTier(v) {
   const s = String(v || "").trim().toLowerCase();
+  if (s === "shared") return "pro"; // legacy alias (brief rename)
   return s === "pro" || s === "dedicated" ? s : "free";
 }
 

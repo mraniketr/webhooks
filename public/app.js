@@ -41,6 +41,7 @@ function showPage(page) {
   const titles = {
     dashboard: ['Overview', 'Webhook health at a glance'],
     webhooks: ['Webhooks', 'All Webhooks'],
+    plans: ['Billing', 'Plans'],
     detail: ['All Webhooks', 'Webhook details'],
     subscription: ['All Webhooks', 'Subscription details'],
     edit: ['All Webhooks', 'Create or edit endpoint'],
@@ -53,7 +54,7 @@ function showPage(page) {
   $('#pageTitle').textContent = title;
   const newBtn = $('#newWebhookBtn');
   if (newBtn) newBtn.classList.toggle('hidden', page !== 'webhooks');
-  if (page === 'dashboard') loadDashboard(); else if (page === 'webhooks') loadWebhooks();
+  if (page === 'dashboard') loadDashboard(); else if (page === 'webhooks') loadWebhooks(); else if (page === 'plans') loadPlans();
   window.scrollTo(0, 0);
 }
 function showAuth() { $('#authView').classList.remove('hidden'); $('#appView').classList.add('hidden'); }
@@ -611,6 +612,60 @@ async function openSubscription(id) {
       + `<div class="panel-head" style="margin-top:18px"><div><h3>Daily breakdown</h3><p>Per-day delivery counts for the last 30 days.</p></div><span class="count-pill">${(d.daily || []).length}</span></div>${(d.daily || []).length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Day</th><th>Queued</th><th>Delivered</th><th>Failed</th></tr></thead><tbody>${dailyRows}</tbody></table></div>` : '<div class="empty">No deliveries yet.</div>'}`;
   } catch (err) { toast(err.message, true); }
 }
+function fmtQuota(v) { return v === null || v === undefined ? 'Unlimited' : Number(v).toLocaleString(); }
+function tpsLabel(plan) {
+  const tps = Number(plan.tps_limit || 0), win = Math.max(1, Number(plan.window_seconds || 60));
+  const perSec = tps / win;
+  const txt = perSec >= 10 ? String(Math.round(perSec)) : String(Math.round(perSec * 100) / 100);
+  return `${txt} TPS (≈${Number(tps).toLocaleString()}/${win}s)`;
+}
+async function loadPlans() {
+  const grid = $('#plansGrid'), usageEl = $('#plansUsage');
+  if (grid) grid.innerHTML = '<div class="empty">Loading plans…</div>';
+  try {
+    const d = await api('/api/plans');
+    const current = d.currentPlan || user?.plan || 'free';
+    if (usageEl) usageEl.textContent = `Current plan: ${current} · ${d.usage?.webhooks ?? 0} webhook(s) · ${d.usage?.dailyUsed ?? 0} event(s) today`;
+    if (!grid) return;
+    grid.innerHTML = '';
+    (d.plans || []).forEach(p => {
+      const isCurrent = p.plan === current;
+      const card = document.createElement('div');
+      card.className = 'plan-card' + (isCurrent ? ' current' : '');
+      card.innerHTML = `<div class="plan-infra">${esc(p.infra || 'shared')} infra</div>`
+        + `<h3>${esc(p.plan)}</h3>`
+        + `<div class="plan-price">${esc(p.price_display || '$0')}</div>`
+        + `<div class="plan-desc">${esc(p.description || '')}</div>`
+        + (isCurrent ? '<div class="plan-current-pill">Current plan</div>' : '')
+        + `<ul class="plan-feats">`
+        + `<li>⚡ <span><b>Push rate:</b> ${esc(tpsLabel(p))}</span></li>`
+        + `<li>📅 <span><b>Daily events:</b> ${esc(fmtQuota(p.daily_limit))}</span></li>`
+        + `<li>◌ <span><b>Webhooks:</b> ${esc(fmtQuota(p.max_webhooks))}</span></li>`
+        + `<li>🔗 <span><b>Subscriptions / webhook:</b> ${esc(fmtQuota(p.max_subs_per_webhook))}</span></li>`
+        + `</ul>`
+        + (p.plan === 'dedicated' && !isCurrent ? '<div class="hint">Dedicated uses isolated queues — provisioned by an admin after you select it. Deliveries fall back to shared until then.</div>' : '');
+      const btn = document.createElement('button');
+      btn.className = isCurrent ? 'ghost full' : 'primary full';
+      btn.textContent = isCurrent ? 'Current plan' : `Select ${p.plan}`;
+      btn.disabled = isCurrent;
+      if (!isCurrent) btn.onclick = () => selectPlan(p.plan, btn);
+      card.append(btn);
+      grid.append(card);
+    });
+  } catch (err) {
+    if (grid) grid.innerHTML = `<div class="empty">Could not load plans: ${esc(err.message)}</div>`;
+  }
+}
+async function selectPlan(plan, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
+  try {
+    const d = await api('/api/plan', { method: 'PUT', body: JSON.stringify({ plan }) });
+    if (d.user) user = d.user;
+    toast(d.unchanged ? `Already on ${plan}` : `Switched to ${plan}` + (d.notice ? ' — ' + d.notice : ''));
+    loadPlans();
+  } catch (err) { toast(err.message, true); if (btn) { btn.disabled = false; btn.textContent = `Select ${plan}`; } }
+}
+const plansRefreshBtn = $('#plansRefreshBtn'); if (plansRefreshBtn) plansRefreshBtn.onclick = loadPlans;
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }
 window.openWebhook = openWebhook; window.openEdit = openEdit; window.openSubscription = openSubscription;
 window.toast = toast; window.copyWebhookUrl = copyWebhookUrl; window.copyWebhookCurl = copyWebhookCurl;
