@@ -626,6 +626,7 @@ async function loadPlans() {
     grid.innerHTML = '';
     (d.plans || []).forEach(p => {
       const isCurrent = p.plan === current;
+      const isCustom = p.plan === 'dedicated';
       const card = document.createElement('div');
       card.className = 'plan-card' + (isCurrent ? ' current' : '');
       card.innerHTML = `<div class="plan-infra">${esc(p.infra || 'shared')} infra</div>`
@@ -634,10 +635,12 @@ async function loadPlans() {
         + `<div class="plan-desc">${esc(p.description || '')}</div>`
         + (isCurrent ? '<div class="plan-current-pill">Current plan</div>' : '')
         + `<ul class="plan-feats">`
-        + `<li>⚡ <span><b>Push rate:</b> ${esc(tpsLabel(p))}</span></li>`
-        + `<li>📅 <span><b>Daily events:</b> ${esc(fmtQuota(p.daily_limit))}</span></li>`
-        + `<li>◌ <span><b>Webhooks:</b> ${esc(fmtQuota(p.max_webhooks))}</span></li>`
-        + `<li>🔗 <span><b>Subscriptions / webhook:</b> ${esc(fmtQuota(p.max_subs_per_webhook))}</span></li>`
+        + `<li>⚡ <span><b>Push rate:</b> ${isCustom ? 'Custom' : esc(tpsLabel(p))}</span></li>`
+        + `<li>📅 <span><b>Daily events:</b> ${isCustom ? 'Custom' : esc(fmtQuota(p.daily_limit))}</span></li>`
+        + `<li>◌ <span><b>Webhooks:</b> ${isCustom ? 'Custom' : esc(fmtQuota(p.max_webhooks))}</span></li>`
+        + `<li>🔗 <span><b>Subscriptions / webhook:</b> ${isCustom ? 'Custom' : esc(fmtQuota(p.max_subs_per_webhook))}</span></li>`
+        + (isCustom ? `<li>📨 <span><b>Queue:</b> Dedicated queue</span></li>`
+          + `<li>🗄️ <span><b>Database:</b> Dedicated database</span></li>` : '')
         + `</ul>`
         + (p.plan === 'dedicated' && !isCurrent ? '<div class="hint">Dedicated uses isolated queues — talk to us and we will provision one for you.</div>' : '');
       if (p.plan === 'dedicated' && !isCurrent) {

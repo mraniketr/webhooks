@@ -527,7 +527,7 @@ const LEGACY_PLAN_ALIASES = { shared: "pro" };
 const FALLBACK_PLAN_LIMITS = {
   free: { tps_limit: 60, burst_limit: 120, window_seconds: 60, daily_limit: 1000, max_webhooks: 2, max_subs_per_webhook: 3, price_cents: 0, price_display: "$0", infra: "shared", description: "Shared infra · for trying things out" },
   pro: { tps_limit: 6000, burst_limit: 12000, window_seconds: 60, daily_limit: 10000, max_webhooks: 10, max_subs_per_webhook: 10, price_cents: 1900, price_display: "$19/mo", infra: "shared", description: "Shared infra · higher throughput" },
-  dedicated: { tps_limit: 100000, burst_limit: 200000, window_seconds: 60, daily_limit: null, max_webhooks: null, max_subs_per_webhook: null, price_cents: 0, price_display: "Custom", infra: "dedicated", description: "Isolated queues · no limits" },
+  dedicated: { tps_limit: 100000, burst_limit: 200000, window_seconds: 60, daily_limit: null, max_webhooks: null, max_subs_per_webhook: null, price_cents: 0, price_display: "Custom", infra: "dedicated", description: "Dedicated queue + database · custom limits" },
 };
 const DEDICATED_QUEUE_RE = /^hooklane-deliveries-ded-[a-z0-9][a-z0-9-]{0,59}$/;
 const MEMORY_RL_KEY = "__hooklane_tier_rl";
