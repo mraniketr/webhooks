@@ -11,6 +11,7 @@ let lastTemplateField = null;
 let currentDetailId = null;
 let currentSubscriptionId = null;
 let currentSubscriptionWebhookId = null;
+let subEditReturnTo = null; // subscription id to return to after subedit (when opened from subscription detail)
 
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }, ...opts });
@@ -118,7 +119,7 @@ function normalizeSubForEditor(s = {}) {
 }
 function openCreate() {
   editingId = null; varCache = { wid: null, variables: null, hasSample: false };
-  editingPre = normalizePreForEditor({}); editingFilter = ''; editingSubs = []; editingSubIndex = null;
+  editingPre = normalizePreForEditor({}); editingFilter = ''; editingSubs = []; editingSubIndex = null; subEditReturnTo = null;
   $('#editEyebrow').textContent = 'NEW ENDPOINT';
   $('#editTitle').textContent = 'Create webhook';
   $('#webhookSubmit').textContent = 'Create webhook';
@@ -132,7 +133,7 @@ async function openEdit(id) {
   try {
     const d = await api('/api/webhooks/' + id);
     editingId = id; varCache = { wid: null, variables: null, hasSample: false };
-    editingSubIndex = null;
+    editingSubIndex = null; subEditReturnTo = null;
     $('#editEyebrow').textContent = 'EDIT ENDPOINT';
     $('#editTitle').textContent = 'Edit webhook';
     $('#webhookSubmit').textContent = 'Save changes';
@@ -254,8 +255,8 @@ function renderSubList() {
       + `<small class="mono">${esc(s.http_method || 'POST')} ${esc(s.target_url || '—')}</small>`
       + `<small>${s.enabled ? 'enabled' : 'disabled'} · ${s.payload_mode === 'custom' ? 'custom JSON' : 'passthrough'}${s.has_secret ? ' · signed' : ''}${hdrCount ? ` · ${hdrCount} header${hdrCount === 1 ? '' : 's'}` : ''}${s.filter_code && String(s.filter_code).trim() ? ' · filtered' : ''}</small></div>`
       + `<div style="display:flex;gap:8px"><button type="button" class="ghost sm">Edit</button></div>`;
-    row.querySelector('button').onclick = (e) => { e.stopPropagation(); openSubEditor(i); };
-    row.onclick = () => { if (s.id) openSubscription(s.id); else openSubEditor(i); };
+    row.querySelector('button').onclick = (e) => { e.stopPropagation(); subEditReturnTo = null; openSubEditor(i); };
+    row.onclick = () => { if (s.id) openSubscription(s.id); else { subEditReturnTo = null; openSubEditor(i); } };
     box.append(row);
   });
 }
@@ -297,7 +298,46 @@ function openSubEditor(index) {
 
 function closeSubEditor() {
   editingSubIndex = null;
+  if (subEditReturnTo) {
+    const sid = subEditReturnTo;
+    subEditReturnTo = null;
+    openSubscription(sid);
+    return;
+  }
   showPage('edit');
+}
+
+// Open the subscription editor directly for a subscription id, loading the
+// parent webhook into the edit state first (without showing the webhook
+// edit page). Used by the Edit button on the subscription read page.
+async function openSubscriptionForEdit(subscriptionId, webhookId) {
+  try {
+    const sid = Number(subscriptionId) || Number(currentSubscriptionId);
+    const wid = Number(webhookId) || Number(currentSubscriptionWebhookId);
+    if (!sid || !wid) { toast('No subscription selected', true); return; }
+    const d = await api('/api/webhooks/' + wid);
+    editingId = wid; varCache = { wid: null, variables: null, hasSample: false };
+    $('#editEyebrow').textContent = 'EDIT ENDPOINT';
+    $('#editTitle').textContent = 'Edit webhook';
+    $('#webhookSubmit').textContent = 'Save changes';
+    $('#webhookName').value = d.webhook.name;
+    $('#webhookStatus').value = d.webhook.status || 'active';
+    editingPre = normalizePreForEditor(d.actions[0] || {});
+    renderPreSummary();
+    editingFilter = d.webhook?.filter_code || '';
+    renderFilterSummary();
+    editingSubs = (d.subscriptions || []).map(normalizeSubForEditor);
+    renderSubList();
+    const idx = editingSubs.findIndex(s => Number(s.id) === sid);
+    if (idx === -1) {
+      toast('Subscription not found on webhook', true);
+      showPage('edit');
+      return;
+    }
+    subEditReturnTo = sid;
+    openSubEditor(idx);
+    loadVariables(wid);
+  } catch (err) { toast(err.message, true); }
 }
 
 function collectSubEditor() {
@@ -463,7 +503,7 @@ const filterEditBtn = $('#filterEditBtn'); if (filterEditBtn) filterEditBtn.oncl
 const backToEditFromFilter = $('#backToEditFromFilter'); if (backToEditFromFilter) backToEditFromFilter.onclick = closeFilterEditor;
 const cancelFilterEdit = $('#cancelFilterEdit'); if (cancelFilterEdit) cancelFilterEdit.onclick = closeFilterEditor;
 const filterTestBtn = $('#filterTestBtn'); if (filterTestBtn) filterTestBtn.onclick = testWebhookFilter;
-$('#addSubBtn').onclick = () => openSubEditor(-1);
+$('#addSubBtn').onclick = () => { subEditReturnTo = null; openSubEditor(-1); };
 $('#cancelEdit').onclick = cancelEdit;
 $('#backToWebhooks').onclick = cancelEdit;
 $('#backToEdit').onclick = closeSubEditor;
@@ -471,7 +511,7 @@ $('#cancelSubEdit').onclick = closeSubEditor;
 $('#backToListBtn').onclick = () => showPage('webhooks');
 $('#detailEditBtn').onclick = () => { if (currentDetailId) openEdit(currentDetailId); };
 $('#backToWebhookBtn').onclick = () => { if (currentSubscriptionWebhookId) openWebhook(currentSubscriptionWebhookId); else if (currentDetailId) openWebhook(currentDetailId); else showPage('webhooks'); };
-$('#subDetailEditBtn').onclick = () => { if (currentSubscriptionWebhookId) openEdit(currentSubscriptionWebhookId); };
+$('#subDetailEditBtn').onclick = () => { if (currentSubscriptionId) openSubscriptionForEdit(currentSubscriptionId, currentSubscriptionWebhookId); };
 $('#subAddHdr').onclick = () => $('#subHeadersBox').append(headerEditorRow('', ''));
 $('#subPayloadMode').onchange = syncSubPayloadMode;
 $('#subVarsBtn').onclick = toggleSubVarPanel;
@@ -498,6 +538,12 @@ $('#subEditForm').onsubmit = async e => {
     }
     editingSubIndex = null;
     renderSubList();
+    if (subEditReturnTo) {
+      const sid = subEditReturnTo;
+      subEditReturnTo = null;
+      openSubscription(sid);
+      return;
+    }
     showPage('edit');
   } catch (err) { toast(err.message, true); }
 };
@@ -675,7 +721,7 @@ async function selectPlan(plan, btn) {
 }
 const plansRefreshBtn = $('#plansRefreshBtn'); if (plansRefreshBtn) plansRefreshBtn.onclick = loadPlans;
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }
-window.openWebhook = openWebhook; window.openEdit = openEdit; window.openSubscription = openSubscription;
+window.openWebhook = openWebhook; window.openEdit = openEdit; window.openSubscription = openSubscription; window.openSubscriptionForEdit = openSubscriptionForEdit;
 window.toast = toast; window.copyWebhookUrl = copyWebhookUrl; window.copyWebhookCurl = copyWebhookCurl;
 window.copyText = copyText; window.buildCurl = buildCurl;
 bootstrap();
