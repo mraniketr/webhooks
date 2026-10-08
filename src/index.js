@@ -120,27 +120,13 @@ async function apiJson(user, env, ttlMs, body, status = 200) {
 function sanitizeUser(u) { return { id: u.id, name: u.name, email: u.email, created_at: u.created_at,
   plan: normalizePlan(u.plan), dedicated_queue: u.dedicated_queue ?? null,
   tps_override: u.tps_override ?? null, is_admin: Number(u.is_admin ?? 0) }; }
-// Subscription-level analytics only: counts come from subscription_counters
-// (maintained async by the analytics queue), never from per-event rows.
-// Webhooks carry no counters of their own.
+// Webhooks carry no counters of their own (subscription-level analytics
+// live behind GET /api/subscriptions/:id, the only stats consumer).
 function webhookView(w, request) {
   return { id: w.id, name: w.name, token: w.token, status: w.status, created_at: w.created_at,
     filter_code: w.filter_code ?? null,
     subscription_count: Number(w.subscription_count ?? 0),
-    enqueued: Number(w.enqueued ?? 0), delivered_ok: Number(w.delivered_ok ?? 0), delivered_failed: Number(w.delivered_failed ?? 0),
     url: `${new URL(request.url).origin}/webhooks/${w.token}` };
-}
-
-// Sum per-subscription counters into a webhook-level aggregate for display.
-function sumSubscriptionStats(subs) {
-  let enqueued = 0, ok = 0, failed = 0;
-  for (const s of subs || []) {
-    const st = s.stats || s;
-    enqueued += Number(st.enqueued ?? 0);
-    ok += Number(st.delivered_ok ?? 0);
-    failed += Number(st.delivered_failed ?? 0);
-  }
-  return { enqueued, delivered_ok: ok, delivered_failed: failed, pending: Math.max(0, enqueued - ok - failed) };
 }
 
 function emptySampleContext() {
@@ -236,6 +222,9 @@ async function saveSubscriptions(env, ctx, wid, subs) {
   webhooks.invalidateRoute(wid);
 }
 
+// Full subscription view WITH delivery stats — used ONLY by
+// GET /api/subscriptions/:id (the subscription detail page, the sole stats
+// consumer). All other endpoints use subscriptionListView below.
 function subscriptionView(s) {
   let headers = {};
   try { headers = parseHeadersJson(s.headers_json ?? s.headers ?? {}); } catch { headers = {}; }
@@ -257,11 +246,30 @@ function subscriptionView(s) {
   };
 }
 
+// Stats-free subscription view for webhook payloads (detail/create/update).
+// The webhook detail page never renders counters, and the editor rebuilds
+// missing stats as zeros — per-subscription stats stay exclusive to
+// GET /api/subscriptions/:id.
+function subscriptionListView(s) {
+  let headers = {};
+  try { headers = parseHeadersJson(s.headers_json ?? s.headers ?? {}); } catch { headers = {}; }
+  return {
+    id: s.id, name: s.name, target_url: s.target_url, enabled: s.enabled, created_at: s.created_at,
+    has_secret: s.has_secret ?? (s.secret ? 1 : 0),
+    http_method: s.http_method || "POST",
+    headers,
+    headers_json: s.headers_json ?? null,
+    payload_mode: s.payload_mode || "passthrough",
+    payload_template: s.payload_template ?? null,
+    filter_code: s.filter_code ?? null,
+  };
+}
+
 async function webhookRelations(env, wid) {
   const { actions, counters } = createRepositories(env, null);
   const actionRows = await actions.listPreAll(wid);
   const subRows = await counters.listByWebhookWithCounters(wid);
-  return { actions: actionRows, subscriptions: (subRows || []).map(subscriptionView) };
+  return { actions: actionRows, subscriptions: (subRows || []).map(subscriptionListView) };
 }
 
 async function mergeSubscriptions(env, ctx, wid, input) {
@@ -755,10 +763,10 @@ export default {
           const w = await getWebhooks.findByIdAndUser(wid, user.id);
           if (!w) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const rel = await webhookRelations(env, wid);
-          const stats = sumSubscriptionStats(rel.subscriptions);
-          return apiJson(user, env, ttlMs, { webhook: webhookView({ ...w, subscription_count: rel.subscriptions.length, ...stats }, request),
-            stats,
-            actions: rel.actions, subscriptions: rel.subscriptions, rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD } });
+          // No metrics here: delivery stats live behind
+          // GET /api/subscriptions/:id (the sole stats consumer).
+          return apiJson(user, env, ttlMs, { webhook: webhookView({ ...w, subscription_count: rel.subscriptions.length }, request),
+            actions: rel.actions, subscriptions: rel.subscriptions });
         }
 
         const subIdMatch = p.match(/^\/api\/subscriptions\/(\d+)$/);
