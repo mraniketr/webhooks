@@ -27,7 +27,6 @@
     <div class="brand"><span class="brand-mark">↯</span><span>Hooklane</span></div>
     <div class="workspace">WEBHOOK CONTROL PLANE</div>
     <nav>
-      <button data-page="dashboard" class="nav-btn active">▦ <span>Overview</span></button>
       <button data-page="webhooks" class="nav-btn">◌ <span>All Webhooks</span></button>
       <button data-page="plans" class="nav-btn">◇ <span>Plans</span></button>
     </nav>
@@ -38,13 +37,6 @@
   </aside>
   <main class="main">
     <header class="topbar"><div><div class="eyebrow" id="pageEyebrow">Overview</div><h2 id="pageTitle">Webhook health at a glance</h2></div><button class="primary" id="newWebhookBtn">＋ New webhook</button></header>
-    <section id="page-dashboard" class="page">
-      <div class="hero-strip"><div><div class="eyebrow">SYSTEM STATUS</div><h3>Accept fast. Process later.</h3><p>Your public endpoints return <b>202 Accepted</b> after the event is queued. The worker runs the pre-action and forwards to subscriptions in the background. Status is in worker logs; analytics are aggregate counts.</p></div><div class="status-pill"><span></span> Operational</div></div>
-      <div class="stats-grid" id="statsGrid"></div>
-      <div class="section-grid">
-        <section class="panel"><div class="panel-head"><div><h3>All Webhooks</h3><p>Your endpoints and delivery volume.</p></div><button class="ghost" id="newWebhookBtn2">Create</button></div><div id="dashboardWebhooks"></div></section>
-      </div>
-    </section>
     <section id="page-webhooks" class="page hidden">
       <div class="panel"><div class="panel-head"><div><h3>All Webhooks</h3><p>Create isolated webhook URLs with a pre-action and templated subscriptions.</p></div></div><div id="webhooksTable" class="table-wrap"></div></div>
     </section>

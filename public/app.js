@@ -1,6 +1,6 @@
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
-let currentPage = 'dashboard', currentWebhook = null, user = null;
+let currentPage = 'webhooks', currentWebhook = null, user = null;
 let editingId = null;
 let editingPre = null;
 let editingFilter = '';
@@ -40,7 +40,6 @@ function showPage(page) {
   const navFor = ['detail', 'edit', 'subedit', 'preedit', 'filteredit', 'subscription'].includes(page) ? 'webhooks' : page;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === navFor));
   const titles = {
-    dashboard: ['Overview', 'Webhook health at a glance'],
     webhooks: ['Webhooks', 'All Webhooks'],
     plans: ['Billing', 'Plans'],
     detail: ['All Webhooks', 'Webhook details'],
@@ -55,7 +54,7 @@ function showPage(page) {
   $('#pageTitle').textContent = title;
   const newBtn = $('#newWebhookBtn');
   if (newBtn) newBtn.classList.toggle('hidden', page !== 'webhooks');
-  if (page === 'dashboard') loadDashboard(); else if (page === 'webhooks') loadWebhooks(); else if (page === 'plans') loadPlans();
+  if (page === 'webhooks') loadWebhooks(); else if (page === 'plans') loadPlans();
   window.scrollTo(0, 0);
 }
 function showAuth() { $('#authView').classList.remove('hidden'); $('#appView').classList.add('hidden'); }
@@ -63,7 +62,7 @@ function showApp() {
   $('#authView').classList.add('hidden'); $('#appView').classList.remove('hidden');
   $('#userName').textContent = user.name; $('#userEmail').textContent = user.email;
   $('#avatar').textContent = user.name?.[0]?.toUpperCase() || 'A';
-  showPage('dashboard');
+  showPage('webhooks');
 }
 async function bootstrap() {
   try {
@@ -495,7 +494,7 @@ async function testWebhookFilter() {
   } catch (err) { box.innerHTML = `<div class="preview-err">${esc(err.message)}</div>`; }
 }
 
-['#newWebhookBtn', '#newWebhookBtn2'].forEach(id => { const e = $(id); if (e) e.onclick = openCreate; });
+{ const e = $('#newWebhookBtn'); if (e) e.onclick = openCreate; }
 const preEditBtn = $('#preEditBtn'); if (preEditBtn) preEditBtn.onclick = () => openPreEditor();
 const backToEditFromPre = $('#backToEditFromPre'); if (backToEditFromPre) backToEditFromPre.onclick = closePreEditor;
 const cancelPreEdit = $('#cancelPreEdit'); if (cancelPreEdit) cancelPreEdit.onclick = closePreEditor;
@@ -599,20 +598,10 @@ $('#webhookForm').onsubmit = async e => {
     }
   } catch (err) { toast(err.message, true); }
 };
-function renderStats(s) {
-  $('#statsGrid').innerHTML = [['Queued', s.enqueued || 0, 'Deliveries fanned out to subscriptions'], ['Delivered', s.delivered_ok || 0, 'Successful forwards'], ['Pending', s.pending || 0, 'Queued or in flight'], ['Failed', s.delivered_failed || 0, 'Failed deliveries']].map(([l, v, sub]) => `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join('');
-}
-async function loadDashboard() {
-  try {
-    const d = await api('/api/dashboard');
-    renderStats(d.stats);
-    $('#dashboardWebhooks').innerHTML = d.webhooks?.length ? `<div class="hook-list">${d.webhooks.slice(0, 6).map(w => `<div class="hook-row clickable" onclick="openWebhook(${w.id})"><div><strong>${esc(w.name)}</strong><small>${w.subscription_count || 0} subscription${(w.subscription_count || 0) === 1 ? '' : 's'} · ${w.delivered_ok || 0} delivered · ${w.status}</small></div><button class="ghost" onclick="event.stopPropagation();openWebhook(${w.id})">Open</button></div>`).join('')}</div>` : '<div class="empty">Create your first webhook.</div>';
-  } catch (err) { toast(err.message, true); }
-}
 async function loadWebhooks() {
   try {
     const d = await api('/api/webhooks');
-    $('#webhooksTable').innerHTML = d.webhooks?.length ? `<table class="table"><thead><tr><th>Name</th><th>Endpoint</th><th>Subscriptions</th><th>Delivered</th><th>Failed</th><th>Status</th><th></th></tr></thead><tbody>${d.webhooks.map(w => `<tr class="clickable" onclick="openWebhook(${w.id})"><td><strong>${esc(w.name)}</strong></td><td class="mono">/webhooks/${w.token.slice(0, 12)}…</td><td>${w.subscription_count ?? 0}</td><td>${w.delivered_ok ?? 0}</td><td>${w.delivered_failed ?? 0}</td><td><span class="badge ${w.status === 'active' ? 'processed' : 'failed'}">${esc(w.status || 'active')}</span></td><td><button class="ghost" onclick="event.stopPropagation();openWebhook(${w.id})">Inspect</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No webhooks yet.</div>';
+    $('#webhooksTable').innerHTML = d.webhooks?.length ? `<table class="table"><thead><tr><th>Name</th><th>Endpoint</th><th>Subscriptions</th><th>Status</th><th></th></tr></thead><tbody>${d.webhooks.map(w => `<tr class="clickable" onclick="openWebhook(${w.id})"><td><strong>${esc(w.name)}</strong></td><td class="mono">/webhooks/${w.token.slice(0, 12)}…</td><td>${w.subscription_count ?? 0}</td><td><span class="badge ${w.status === 'active' ? 'processed' : 'failed'}">${esc(w.status || 'active')}</span></td><td><button class="ghost" onclick="event.stopPropagation();openWebhook(${w.id})">Inspect</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No webhooks yet.</div>';
   } catch (err) { toast(err.message, true); }
 }
 async function openWebhook(id) {
@@ -667,7 +656,7 @@ async function loadPlans() {
   try {
     const d = await api('/api/plans');
     const current = d.currentPlan || user?.plan || 'free';
-    if (usageEl) usageEl.textContent = `Current plan: ${current} · ${d.usage?.webhooks ?? 0} webhook(s) · ${d.usage?.dailyUsed ?? 0} event(s) today`;
+    if (usageEl) usageEl.textContent = `Current plan: ${current}`;
     if (!grid) return;
     grid.innerHTML = '';
     (d.plans || []).forEach(p => {
