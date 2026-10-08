@@ -1,5 +1,5 @@
 import { buildContext, evaluateFilter, renderSubscription } from "./template.js";
-import { getSubscription, getWebhookRow } from "./cache.js";
+import { createRepositories } from "./repositories/index.js";
 import { analyticsMsg, deliveryDelay, emitAnalytics, eventDelay, hmacHex, logEventStatus, normalizeTier, rowFromMessage } from "./processing.js";
 
 // Delivery worker: consumes ONLY `hooklane-deliveries-*` queues (shared,
@@ -22,22 +22,18 @@ async function processDelivery(message, env, ctx) {
   const subscriptionId = Number(msg.subscriptionId);
   if (!eventId || !webhookId || !subscriptionId) return;
 
-  // Both reads are cached and run concurrently — steady traffic skips D1.
+  // Both reads are cached (KV-only) and run concurrently — steady traffic
+  // skips D1. No raw env.DB here; repos own all SQL via IDbAccessor.
+  const { subscriptions, webhooks } = createRepositories(env, ctx);
   let [sub, webhookRow] = await Promise.all([
-    getSubscription(env, ctx, subscriptionId, async () =>
-      env.DB.prepare("SELECT * FROM subscriptions WHERE id=?").bind(subscriptionId).first().catch(() => null)
-    ).catch(() => null),
-    getWebhookRow(env, ctx, webhookId, async () =>
-      env.DB.prepare("SELECT id,name,filter_code FROM webhooks WHERE id=?").bind(webhookId).first()
-        .catch(() => env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null))
-    ).catch(() => null),
+    subscriptions.findByIdCached(subscriptionId).catch(() => null),
+    webhooks.findRowCached(webhookId).catch(() => null),
   ]);
   // Stale-disabled guard: a cached disabled/missing row must never drop a
-  // delivery right after a re-enable. Re-check D1 once before skipping.
+  // delivery right after a re-enable. Re-check via repo (uncached) once.
   if (!sub || !sub.enabled) {
     try {
-      const fresh = await env.DB.prepare("SELECT * FROM subscriptions WHERE id=?")
-        .bind(subscriptionId).first().catch(() => null);
+      const fresh = await subscriptions.findByIdDirect(subscriptionId);
       if (fresh && fresh.enabled) sub = fresh;
     } catch { /* keep cached value */ }
   }

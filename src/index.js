@@ -1,5 +1,5 @@
 import { buildContext, evaluateFilter, evaluatePreAssignment, listVariables, parseHeadersJson, renderSubscription } from "./template.js";
-import { getPlanConfig, getUserTier, getWebhookByToken, invalidateAllSubscriptions, invalidatePlans, invalidateRouteConfig, invalidateSubscription, invalidateUserTier, invalidateWebhook } from "./cache.js";
+import { createRepositories } from "./repositories/index.js";
 
 // Queue messages cap at 128 KiB — keep inbound bodies well under that so the
 // full event (payload + headers + query + envelope) fits in one message.
@@ -34,13 +34,9 @@ function googleRedirectUri(request) {
   return `${new URL(request.url).origin}/api/auth/google/callback`;
 }
 async function ensureGoogleColumn(env) {
-  // Best-effort auto-migration for DBs created before google_sub existed.
-  try {
-    const cols = await env.DB.prepare("PRAGMA table_info(users)").all();
-    const names = new Set((cols.results || []).map((c) => c.name));
-    if (!names.has("google_sub")) await env.DB.prepare("ALTER TABLE users ADD COLUMN google_sub TEXT").run();
-    await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)").run();
-  } catch { /* ignore — callback falls back to email-only lookup */ }
+  // Delegates to UserRepository (owns the users table via IDbAccessor).
+  const { users } = createRepositories(env, null);
+  await users.ensureGoogleColumn();
 }
 
 function json(body, status = 200, headers = {}) {
@@ -224,98 +220,20 @@ function normalizeSubscriptions(input) {
 }
 
 async function saveActions(env, ctx, wid, actions) {
-  await env.DB.prepare("DELETE FROM actions WHERE webhook_id=?").bind(wid).run();
-  for (let i = 0; i < actions.length; i++) {
-    const a = actions[i];
-    await env.DB.prepare("INSERT INTO actions (webhook_id,phase,name,code,sort_order,enabled) VALUES (?,?,?,?,?,?)")
-      .bind(wid, a.phase, a.name, a.code, i, a.enabled).run();
-  }
-  invalidateRouteConfig(env, ctx, wid);
-}
-
-async function ensureWebhookFilterColumn(env) {
-  try {
-    const cols = await env.DB.prepare("PRAGMA table_info(webhooks)").all();
-    const names = new Set((cols.results || []).map((c) => c.name));
-    if (!names.has("filter_code")) await env.DB.prepare("ALTER TABLE webhooks ADD COLUMN filter_code TEXT").run();
-  } catch { /* ignore — callers fall back */ }
-}
-
-async function ensureSubscriptionColumns(env) {
-  // Best-effort auto-migration for DBs created before the templating fields.
-  try {
-    const cols = await env.DB.prepare("PRAGMA table_info(subscriptions)").all();
-    const names = new Set((cols.results || []).map((c) => c.name));
-    if (!names.has("http_method")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN http_method TEXT DEFAULT 'POST'").run();
-    if (!names.has("headers_json")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN headers_json TEXT").run();
-    if (!names.has("payload_mode")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_mode TEXT DEFAULT 'passthrough'").run();
-    if (!names.has("payload_template")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN payload_template TEXT").run();
-    if (!names.has("filter_code")) await env.DB.prepare("ALTER TABLE subscriptions ADD COLUMN filter_code TEXT").run();
-  } catch { /* D1 may disallow PRAGMA in some contexts — callers fall back */ }
-}
-
-async function ensureSubscriptionCounterTables(env) {
-  // Best-effort auto-migration for DBs created before subscription counters.
-  try {
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_counters (
-      subscription_id INTEGER PRIMARY KEY,
-      webhook_id INTEGER NOT NULL,
-      enqueued INTEGER NOT NULL DEFAULT 0,
-      delivered_ok INTEGER NOT NULL DEFAULT 0,
-      delivered_failed INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL,
-      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
-      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
-    )`).run();
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS subscription_daily_counters (
-      subscription_id INTEGER NOT NULL,
-      day TEXT NOT NULL,
-      enqueued INTEGER NOT NULL DEFAULT 0,
-      delivered_ok INTEGER NOT NULL DEFAULT 0,
-      delivered_failed INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (subscription_id, day),
-      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-    )`).run();
-  } catch { /* ignore — readers fall back to zeros */ }
+  const { actions: actionRepo, webhooks: actionWebhooks } = createRepositories(env, ctx);
+  await actionRepo.saveAll(wid, actions);
+  actionWebhooks.invalidateRoute(wid);
 }
 
 async function saveSubscriptions(env, ctx, wid, subs) {
-  await ensureSubscriptionColumns(env);
-  await ensureSubscriptionCounterTables(env);
+  const { subscriptions, counters, webhooks } = createRepositories(env, ctx);
+  await subscriptions.ensureColumns();
+  await counters.ensureTables();
   // Remove counters for subscriptions about to be replaced (FK cascade may
   // be off if PRAGMA foreign_keys was never enabled on this connection).
-  try {
-    await env.DB.prepare(`DELETE FROM subscription_counters WHERE webhook_id=?`).bind(wid).run();
-    await env.DB.prepare(`DELETE FROM subscription_daily_counters WHERE subscription_id NOT IN (SELECT id FROM subscriptions)`).run();
-  } catch { /* counters table may not exist on very old DBs — created above */ }
-  await env.DB.prepare("DELETE FROM subscriptions WHERE webhook_id=?").bind(wid).run();
-  const created = now();
-  for (const s of subs) {
-    let subId = 0;
-    try {
-      const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,filter_code,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(wid, s.name, s.target_url, s.secret, s.enabled, s.http_method || "POST", s.headers_json || null, s.payload_mode || "passthrough", s.payload_template || null, s.filter_code || null, created).run();
-      subId = Number(r.meta.last_row_id) || 0;
-    } catch {
-      try {
-        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-          .bind(wid, s.name, s.target_url, s.secret, s.enabled, s.http_method || "POST", s.headers_json || null, s.payload_mode || "passthrough", s.payload_template || null, created).run();
-        subId = Number(r.meta.last_row_id) || 0;
-      } catch {
-        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
-          .bind(wid, s.name, s.target_url, s.secret, s.enabled, created).run();
-        subId = Number(r.meta.last_row_id) || 0;
-      }
-    }
-    if (subId) {
-      try {
-        await env.DB.prepare("INSERT OR IGNORE INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at) VALUES (?,?,?,?,?,?)")
-          .bind(subId, wid, 0, 0, 0, now()).run();
-      } catch { /* ignore */ }
-    }
-  }
-  invalidateAllSubscriptions(env, ctx, wid);
+  await counters.deleteForWebhook(wid);
+  await subscriptions.replaceAll(wid, subs, { seedCounters: (sid) => counters.seed(sid, wid) });
+  webhooks.invalidateRoute(wid);
 }
 
 function subscriptionView(s) {
@@ -340,36 +258,10 @@ function subscriptionView(s) {
 }
 
 async function webhookRelations(env, wid) {
-  const actions = await env.DB.prepare("SELECT id,phase,name,code,sort_order,enabled FROM actions WHERE webhook_id=? AND phase='pre' ORDER BY sort_order,id").bind(wid).all();
-  await ensureSubscriptionCounterTables(env);
-  await ensureSubscriptionColumns(env);
-  let subscriptions;
-  try {
-    subscriptions = await env.DB.prepare(`SELECT s.id,s.name,s.target_url,s.enabled,s.created_at,s.http_method,s.headers_json,s.payload_mode,s.payload_template,s.filter_code,
-      CASE WHEN s.secret IS NOT NULL AND s.secret != '' THEN 1 ELSE 0 END AS has_secret,
-      COALESCE(c.enqueued,0) enqueued, COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
-      FROM subscriptions s LEFT JOIN subscription_counters c ON c.subscription_id=s.id
-      WHERE s.webhook_id=? ORDER BY s.id`).bind(wid).all();
-  } catch {
-    try {
-      subscriptions = await env.DB.prepare(`SELECT s.id,s.name,s.target_url,s.enabled,s.created_at,s.http_method,s.headers_json,s.payload_mode,s.payload_template,
-      CASE WHEN s.secret IS NOT NULL AND s.secret != '' THEN 1 ELSE 0 END AS has_secret,
-      COALESCE(c.enqueued,0) enqueued, COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
-      FROM subscriptions s LEFT JOIN subscription_counters c ON c.subscription_id=s.id
-      WHERE s.webhook_id=? ORDER BY s.id`).bind(wid).all();
-    } catch {
-    try {
-      subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,http_method,headers_json,payload_mode,payload_template,
-        CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
-        FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
-    } catch {
-      subscriptions = await env.DB.prepare(`SELECT id,name,target_url,enabled,created_at,
-        CASE WHEN secret IS NOT NULL AND secret != '' THEN 1 ELSE 0 END AS has_secret
-        FROM subscriptions WHERE webhook_id=? ORDER BY id`).bind(wid).all();
-    }
-    }
-  }
-  return { actions: actions.results, subscriptions: (subscriptions.results || []).map(subscriptionView) };
+  const { actions, counters } = createRepositories(env, null);
+  const actionRows = await actions.listPreAll(wid);
+  const subRows = await counters.listByWebhookWithCounters(wid);
+  return { actions: actionRows, subscriptions: (subRows || []).map(subscriptionView) };
 }
 
 async function mergeSubscriptions(env, ctx, wid, input) {
@@ -377,85 +269,19 @@ async function mergeSubscriptions(env, ctx, wid, input) {
   // the client leaves it blank); insert new rows; delete removed rows.
   // Per-subscription counters are preserved on update, seeded on insert,
   // and removed with the subscription on delete.
-  await ensureSubscriptionColumns(env);
-  await ensureSubscriptionCounterTables(env);
-  const current = await env.DB.prepare("SELECT * FROM subscriptions WHERE webhook_id=?").bind(wid).all();
-  const byId = new Map(current.results.map((s) => [s.id, s]));
-  const seen = new Set();
-  for (const item of input) {
-    const id = Number(item.id);
-    if (id && byId.has(id)) {
-      seen.add(id);
-      const prev = byId.get(id);
-      const nextFilter = item.filter_code !== undefined && item.filter_code !== null ? item.filter_code : (prev.filter_code ?? null);
-      try {
-        await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=?, http_method=?, headers_json=?, payload_mode=?, payload_template=?, filter_code=? WHERE id=?")
-          .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled,
-            item.http_method || prev.http_method || "POST",
-            item.headers_json ?? prev.headers_json,
-            item.payload_mode || prev.payload_mode || "passthrough",
-            item.payload_mode === "custom" ? (item.payload_template || null) : null,
-            nextFilter || null, id).run();
-      } catch {
-        try {
-          await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=?, http_method=?, headers_json=?, payload_mode=?, payload_template=? WHERE id=?")
-            .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled,
-              item.http_method || prev.http_method || "POST",
-              item.headers_json ?? prev.headers_json,
-              item.payload_mode || prev.payload_mode || "passthrough",
-              item.payload_mode === "custom" ? (item.payload_template || null) : null, id).run();
-        } catch {
-          await env.DB.prepare("UPDATE subscriptions SET name=?, target_url=?, secret=?, enabled=? WHERE id=?")
-            .bind(item.name, item.target_url, item.secret ? item.secret : prev.secret, item.enabled, id).run();
-        }
-      }
-    } else {
-      let newId = 0;
-      try {
-        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,filter_code,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-          .bind(wid, item.name, item.target_url, item.secret || null, item.enabled,
-            item.http_method || "POST", item.headers_json || null, item.payload_mode || "passthrough",
-            item.payload_mode === "custom" ? (item.payload_template || null) : null,
-            item.filter_code || null, now()).run();
-        newId = Number(r.meta.last_row_id) || 0;
-      } catch {
-      try {
-        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,http_method,headers_json,payload_mode,payload_template,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-          .bind(wid, item.name, item.target_url, item.secret || null, item.enabled,
-            item.http_method || "POST", item.headers_json || null, item.payload_mode || "passthrough",
-            item.payload_mode === "custom" ? (item.payload_template || null) : null, now()).run();
-        newId = Number(r.meta.last_row_id) || 0;
-      } catch {
-        const r = await env.DB.prepare("INSERT INTO subscriptions (webhook_id,name,target_url,secret,enabled,created_at) VALUES (?,?,?,?,?,?)")
-          .bind(wid, item.name, item.target_url, item.secret || null, item.enabled, now()).run();
-        newId = Number(r.meta.last_row_id) || 0;
-      }
-      }
-      if (newId) {
-        try {
-          await env.DB.prepare("INSERT OR IGNORE INTO subscription_counters (subscription_id, webhook_id, enqueued, delivered_ok, delivered_failed, updated_at) VALUES (?,?,?,?,?,?)")
-            .bind(newId, wid, 0, 0, 0, now()).run();
-        } catch { /* ignore */ }
-      }
-    }
-  }
-  for (const s of current.results) {
-    if (!seen.has(s.id)) {
-      await env.DB.prepare("DELETE FROM subscriptions WHERE id=?").bind(s.id).run();
-      try {
-        await env.DB.prepare("DELETE FROM subscription_counters WHERE subscription_id=?").bind(s.id).run();
-        await env.DB.prepare("DELETE FROM subscription_daily_counters WHERE subscription_id=?").bind(s.id).run();
-      } catch { /* ignore */ }
-      invalidateSubscription(env, ctx, s.id);
-    }
-  }
-  invalidateAllSubscriptions(env, ctx, wid);
+  const { subscriptions, counters, webhooks } = createRepositories(env, ctx);
+  await subscriptions.merge(wid, input, {
+    seedCounters: (sid) => counters.seed(sid, wid),
+    deleteCounters: (sid) => counters.deleteForSubscription(sid),
+  });
+  webhooks.invalidateRoute(wid);
 }
 
 async function sampleContextForWebhook(env, wid) {
   // Per-event rows are no longer stored — always return the seeded sample.
   // (Preview/probe rendering uses this; live traffic renders per message.)
-  const webhook = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(wid).first().catch(() => null);
+  const { webhooks } = createRepositories(env, null);
+  const webhook = await webhooks.findBasicById(wid);
   const ctx = emptySampleContext();
   if (webhook) ctx.webhook = { id: webhook.id, name: webhook.name || "" };
   return { context: ctx, hasSample: false };
@@ -486,11 +312,8 @@ async function auth(request, env) {
   const sid = getCookie(request, "sid");
   const uid = await verifySession(sid, env.APP_SECRET);
   if (!uid) return null;
-  try {
-    return await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(uid).first();
-  } catch {
-    return await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(uid).first();
-  }
+  const { users } = createRepositories(env, null);
+  return users.findById(uid);
 }
 
 // API + producer worker: serves HTTP and enqueues webhook events.
@@ -513,8 +336,9 @@ async function rateLimit(request, env, userId) {
 // Plans live in D1 (editable via Admin API, cached ~15s). The Workers
 // Rate-Limit binding can't vary per tier (limit is fixed in wrangler.jsonc),
 // so tier TPS is enforced here with a best-effort fixed-window counter in
-// KV (cross-isolate) with an in-memory per-isolate fallback. Over-admission
-// under races is possible; the binding above stays as the hard guardrail.
+// KV (cross-isolate, KV-only — no in-memory state on serverless).
+// Over-admission under races is possible; the binding above stays as the
+// hard guardrail.
 //
 // Canonical plans: free, pro, dedicated. 'shared' is a legacy alias for
 // 'pro' (DB rows / API callers from the brief rename) — normalizePlan maps it.
@@ -530,7 +354,9 @@ const FALLBACK_PLAN_LIMITS = {
   dedicated: { tps_limit: 100000, burst_limit: 200000, window_seconds: 60, daily_limit: null, max_webhooks: null, max_subs_per_webhook: null, price_cents: 0, price_display: "Custom", infra: "dedicated", description: "Dedicated queue + database · custom limits" },
 };
 const DEDICATED_QUEUE_RE = /^hooklane-deliveries-ded-[a-z0-9][a-z0-9-]{0,59}$/;
-const MEMORY_RL_KEY = "__hooklane_tier_rl";
+// Serverless: NO in-memory Maps. Rate-limit windows live in KV only
+// (via ICacheAccessor). When KV is unbound we fail open — the Workers
+// Rate-Limit binding above stays the hard guardrail.
 
 function normalizePlan(v) {
   const s = String(v || "").trim().toLowerCase();
@@ -538,132 +364,11 @@ function normalizePlan(v) {
   return VALID_PLANS.has(s) ? s : "free";
 }
 
-function memoryRl() {
-  if (!globalThis[MEMORY_RL_KEY]) globalThis[MEMORY_RL_KEY] = new Map();
-  return globalThis[MEMORY_RL_KEY];
-}
+// (memoryRl removed — serverless uses KV cache accessor only)
 
-async function ensureUserTierColumns(env) {
-  try {
-    const cols = await env.DB.prepare("PRAGMA table_info(users)").all();
-    const names = new Set((cols.results || []).map((c) => c.name));
-    if (!names.has("plan")) await env.DB.prepare("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'").run();
-    if (!names.has("dedicated_queue")) await env.DB.prepare("ALTER TABLE users ADD COLUMN dedicated_queue TEXT").run();
-    if (!names.has("tps_override")) await env.DB.prepare("ALTER TABLE users ADD COLUMN tps_override INTEGER").run();
-    if (!names.has("is_admin")) await env.DB.prepare("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0").run();
-  } catch { /* ignore — callers fall back to free tier */ }
-}
-
-async function ensurePlansTable(env) {
-  try {
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS plans (
-      plan TEXT PRIMARY KEY CHECK(plan IN ('free','shared','dedicated','pro')),
-      tps_limit INTEGER NOT NULL,
-      burst_limit INTEGER NOT NULL,
-      window_seconds INTEGER NOT NULL DEFAULT 60,
-      daily_limit INTEGER,
-      max_webhooks INTEGER,
-      max_subs_per_webhook INTEGER,
-      price_cents INTEGER NOT NULL DEFAULT 0,
-      price_display TEXT NOT NULL DEFAULT '$0',
-      infra TEXT NOT NULL DEFAULT 'shared',
-      description TEXT,
-      updated_at TEXT NOT NULL
-    )`).run();
-    // Best-effort ALTERs for DBs created with the old 4-column schema.
-    try {
-      const cols = await env.DB.prepare("PRAGMA table_info(plans)").all();
-      const names = new Set((cols.results || []).map((c) => c.name));
-      if (!names.has("daily_limit")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN daily_limit INTEGER").run();
-      if (!names.has("max_webhooks")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN max_webhooks INTEGER").run();
-      if (!names.has("max_subs_per_webhook")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN max_subs_per_webhook INTEGER").run();
-      if (!names.has("price_cents")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN price_cents INTEGER NOT NULL DEFAULT 0").run();
-      if (!names.has("price_display")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN price_display TEXT NOT NULL DEFAULT '$0'").run();
-      if (!names.has("infra")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN infra TEXT NOT NULL DEFAULT 'shared'").run();
-      if (!names.has("description")) await env.DB.prepare("ALTER TABLE plans ADD COLUMN description TEXT").run();
-    } catch { /* old SQLite without support — loader falls back per-row */ }
-    const ts = now();
-    const fb = FALLBACK_PLAN_LIMITS;
-    await env.DB.batch([
-      env.DB.prepare(`INSERT OR IGNORE INTO plans
-        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
-        VALUES ('free',?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(fb.free.tps_limit, fb.free.burst_limit, fb.free.window_seconds, fb.free.daily_limit, fb.free.max_webhooks, fb.free.max_subs_per_webhook, fb.free.price_cents, fb.free.price_display, fb.free.infra, fb.free.description, ts),
-      env.DB.prepare(`INSERT OR IGNORE INTO plans
-        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
-        VALUES ('pro',?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(fb.pro.tps_limit, fb.pro.burst_limit, fb.pro.window_seconds, fb.pro.daily_limit, fb.pro.max_webhooks, fb.pro.max_subs_per_webhook, fb.pro.price_cents, fb.pro.price_display, fb.pro.infra, fb.pro.description, ts),
-      env.DB.prepare(`INSERT OR IGNORE INTO plans
-        (plan,tps_limit,burst_limit,window_seconds,daily_limit,max_webhooks,max_subs_per_webhook,price_cents,price_display,infra,description,updated_at)
-        VALUES ('dedicated',?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(fb.dedicated.tps_limit, fb.dedicated.burst_limit, fb.dedicated.window_seconds, fb.dedicated.daily_limit, fb.dedicated.max_webhooks, fb.dedicated.max_subs_per_webhook, fb.dedicated.price_cents, fb.dedicated.price_display, fb.dedicated.infra, fb.dedicated.description, ts),
-    ]);
-    // Migrate any legacy 'shared' plan row back to 'pro'.
-    try {
-      const shared = await env.DB.prepare("SELECT * FROM plans WHERE plan='shared'").first().catch(() => null);
-      if (shared) {
-        const pro = await env.DB.prepare("SELECT * FROM plans WHERE plan='pro'").first().catch(() => null);
-        if (!pro) {
-          await env.DB.prepare("UPDATE plans SET plan='pro' WHERE plan='shared'").run().catch(() => {});
-        } else {
-          await env.DB.prepare("DELETE FROM plans WHERE plan='shared'").run().catch(() => {});
-        }
-        await env.DB.prepare("UPDATE users SET plan='pro' WHERE plan='shared'").run().catch(() => {});
-      }
-    } catch { /* ignore */ }
-  } catch { /* ignore — callers fall back to defaults */ }
-}
-
-function nullableLimit(v) {
-  // NULL/undefined/empty = unlimited. 0 and negatives are treated as unlimited
-  // too (a zero quota would otherwise brick the plan).
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.floor(n);
-}
-
-async function loadPlanConfig(env) {
-  await ensurePlansTable(env);
-  try {
-    const rows = await env.DB.prepare("SELECT * FROM plans").all();
-    const out = {};
-    for (const r of rows.results || []) {
-      const plan = normalizePlan(r.plan);
-      if (!FALLBACK_PLAN_LIMITS[plan]) continue; // skip unknown plan rows
-      const fb = FALLBACK_PLAN_LIMITS[plan];
-      // NULL in DB = unlimited (dedicated). Missing column (pre-migration
-      // row shape) or garbage = plan fallback.
-      const quotaOrFallback = (v, fallback) => {
-        if (v === null || v === undefined) {
-          // Column present with NULL = explicit unlimited; column absent
-          // entirely (undefined) = fall back.
-          return v === null ? null : fallback;
-        }
-        if (v === "") return fallback;
-        const n = Number(v);
-        if (!Number.isFinite(n)) return fallback;
-        if (n <= 0) return null; // 0/negative quota would brick the plan → unlimited
-        return Math.floor(n);
-      };
-      out[plan] = {
-        tps_limit: Math.max(1, Number(r.tps_limit) || fb.tps_limit),
-        burst_limit: Math.max(1, Number(r.burst_limit) || fb.burst_limit),
-        window_seconds: Math.min(3600, Math.max(1, Number(r.window_seconds) || 60)),
-        daily_limit: quotaOrFallback(r.daily_limit, fb.daily_limit),
-        max_webhooks: quotaOrFallback(r.max_webhooks, fb.max_webhooks),
-        max_subs_per_webhook: quotaOrFallback(r.max_subs_per_webhook, fb.max_subs_per_webhook),
-        price_cents: Number(r.price_cents ?? fb.price_cents) || 0,
-        price_display: r.price_display ?? fb.price_display,
-        infra: r.infra || fb.infra,
-        description: r.description ?? fb.description ?? null,
-      };
-    }
-    return { ...structuredFallbackPlans(), ...out };
-  } catch {
-    return structuredFallbackPlans();
-  }
-}
+// NOTE: schema auto-migrations (users.plan columns, plans table, webhook
+// filter_code, subscription columns/counters) live in the repositories —
+// every write path ensures its own tables. No ensure* wrappers here.
 
 function structuredFallbackPlans() {
   return JSON.parse(JSON.stringify(FALLBACK_PLAN_LIMITS));
@@ -699,13 +404,12 @@ function utcDayString(d = new Date()) {
 }
 
 async function kvRead(env, key) {
+  // KV-only counter read via ICacheAccessor. Returns null when KV is
+  // unbound (caller treats as 0 / fail-open).
   try {
-    const kv = env?.WEBHOOK_CACHE;
-    if (!kv || typeof kv.get !== "function") return null;
-    const raw = await kv.get(key, "text");
-    if (raw == null) return null;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) ? n : null;
+    const { createAccessors } = await import("./accessors/index.js");
+    const { cache } = createAccessors(env);
+    return await cache.getCounter(key);
   } catch {
     return null;
   }
@@ -713,55 +417,23 @@ async function kvRead(env, key) {
 
 async function getUserDailyUsage(env, userId) {
   const count = await kvRead(env, `rl:daily:${userId}:${utcDayString()}`);
-  if (count != null) return count;
-  // Memory fallback mirrors the KV counter for single-isolate dev.
-  const m = memoryRl().get(`rl:daily:${userId}:${utcDayString()}`);
-  return m ? m.count : 0;
-}
-
-async function loadUserTier(env, userId) {
-  await ensureUserTierColumns(env);
-  try {
-    const row = await env.DB.prepare("SELECT plan,dedicated_queue,tps_override FROM users WHERE id=?").bind(userId).first();
-    if (!row) return { plan: "free", dedicated_queue: null, tps_override: null };
-    return {
-      plan: normalizePlan(row.plan),
-      dedicated_queue: row.dedicated_queue || null,
-      tps_override: row.tps_override != null && Number(row.tps_override) > 0 ? Math.floor(Number(row.tps_override)) : null,
-    };
-  } catch {
-    return { plan: "free", dedicated_queue: null, tps_override: null };
-  }
+  return count ?? 0;
 }
 
 async function kvRlIncrement(env, key, windowSeconds) {
-  // Returns the new count, or null when KV is unavailable (caller falls back
-  // to memory). Read-modify-write races can over-admit slightly — accepted
-  // for a gateway TPS gate; the Workers binding is the hard ceiling.
+  // KV-only fixed-window increment via ICacheAccessor. Returns null when KV
+  // is unavailable — callers fail open (the Workers binding is the hard
+  // ceiling). Read-modify-write races can over-admit slightly; accepted.
   try {
-    const kv = env?.WEBHOOK_CACHE;
-    if (!kv || typeof kv.get !== "function" || typeof kv.put !== "function") return null;
-    const raw = await kv.get(key, "text");
-    const count = (raw ? parseInt(raw, 10) || 0 : 0) + 1;
-    await kv.put(key, String(count), { expirationTtl: Math.max(1, Math.ceil(windowSeconds * 2)) });
-    return count;
+    const { createAccessors } = await import("./accessors/index.js");
+    const { cache } = createAccessors(env);
+    return await cache.incrCounter(key, windowSeconds);
   } catch {
     return null;
   }
 }
 
-function memoryRlIncrement(key, windowSeconds) {
-  const m = memoryRl();
-  const nowMs = Date.now();
-  const entry = m.get(key);
-  if (!entry || entry.exp <= nowMs) {
-    const fresh = { count: 1, exp: nowMs + windowSeconds * 1000 };
-    m.set(key, fresh);
-    return 1;
-  }
-  entry.count += 1;
-  return entry.count;
-}
+// (memoryRlIncrement removed — serverless uses KV cache accessor only)
 
 async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
   const limits = effectiveTierLimit(planCfg, tierRow);
@@ -769,7 +441,7 @@ async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
   const windowStart = Math.floor(Date.now() / 1000 / win);
   const sustainedKey = `rl:tier:${userId}:${limits.tps_limit}:${win}:${windowStart}`;
   let count = await kvRlIncrement(env, sustainedKey, win);
-  if (count == null) count = memoryRlIncrement(sustainedKey, win);
+  if (count == null) count = 1; // KV unbound → fail open (binding above is the hard ceiling)
   if (count > limits.tps_limit) {
     return { allowed: false, limits, count, retryAfter: win, reason: "tps" };
   }
@@ -779,7 +451,7 @@ async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
   const burstStart = Math.floor(Date.now() / 1000 / burstWindow);
   const burstKey = `rl:burst:${userId}:${burstCap}:${burstWindow}:${burstStart}`;
   let bcount = await kvRlIncrement(env, burstKey, burstWindow);
-  if (bcount == null) bcount = memoryRlIncrement(burstKey, burstWindow);
+  if (bcount == null) bcount = 1; // KV unbound → fail open
   if (bcount > burstCap) {
     return { allowed: false, limits, count: bcount, retryAfter: burstWindow, reason: "burst" };
   }
@@ -791,7 +463,7 @@ async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
     const day = utcDayString();
     const dailyKey = `rl:daily:${userId}:${day}`;
     let d = await kvRlIncrement(env, dailyKey, 86400);
-    if (d == null) d = memoryRlIncrement(dailyKey, 86400);
+    if (d == null) d = 1; // KV unbound → fail open
     dailyCount = d;
     if (d > limits.daily_limit) {
       const secsLeft = Math.max(1, Math.ceil((new Date(`${day}T24:00:00Z`).getTime() - Date.now()) / 1000));
@@ -804,21 +476,13 @@ async function tierRateLimit(env, ctx, userId, tierRow, planCfg) {
 }
 
 async function countUserWebhooks(env, userId) {
-  try {
-    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM webhooks WHERE user_id=?").bind(userId).first();
-    return Number(row?.n ?? 0);
-  } catch {
-    return 0;
-  }
+  const { webhooks } = createRepositories(env, null);
+  return webhooks.countByUser(userId);
 }
 
 async function countWebhookSubscriptions(env, webhookId) {
-  try {
-    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE webhook_id=?").bind(webhookId).first();
-    return Number(row?.n ?? 0);
-  } catch {
-    return 0;
-  }
+  const { subscriptions } = createRepositories(env, null);
+  return subscriptions.countByWebhook(webhookId);
 }
 
 export default {
@@ -826,6 +490,9 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname;
     const ttlMs = sessionTtlMs(env);
+    // Shared repository set for this request (all D1/KV access flows through
+    // IDbAccessor / ICacheAccessor — no raw env.DB / env.WEBHOOK_CACHE below).
+    const repos = createRepositories(env, ctx);
 
     if (p === "/" && request.method === "GET") return env.ASSETS.fetch(request);
     if (p.endsWith(".js") || p.endsWith(".css") || p.endsWith(".html")) return env.ASSETS.fetch(request);
@@ -892,25 +559,24 @@ export default {
         if (profile?.email_verified === false) return fail("Google email is not verified.");
         const name = String(profile?.name || profile?.given_name || email.split("@")[0]).slice(0, 200);
         await ensureGoogleColumn(env);
+        const { users: ssoUsers } = createRepositories(env, null);
         let user = null;
         try {
-          user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE google_sub=?").bind(sub).first();
+          user = await ssoUsers.findByGoogleSub(sub);
         } catch { user = null; }
         if (!user) {
-          const byEmail = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE email=?").bind(email).first();
+          const byEmail = await ssoUsers.findByEmail(email);
           if (byEmail) {
             try {
-              await env.DB.prepare("UPDATE users SET google_sub=? WHERE id=?").bind(sub, byEmail.id).run();
+              await ssoUsers.linkGoogleSub(byEmail.id, sub);
             } catch {
               return fail("This email is already registered with a different Google account.");
             }
             user = byEmail;
           } else {
             const created = now();
-            const result = await env.DB.prepare(
-              "INSERT INTO users (email,name,created_at,google_sub) VALUES (?,?,?,?)"
-            ).bind(email, name, created, sub).run();
-            user = await env.DB.prepare("SELECT id,email,name,created_at FROM users WHERE id=?").bind(result.meta.last_row_id).first();
+            const newId = await ssoUsers.create({ email, name, createdAt: created, googleSub: sub });
+            user = await ssoUsers.findById(newId);
           }
         }
         if (!user) return fail("Could not create account.");
@@ -937,7 +603,7 @@ export default {
 
         if (request.method === "GET" && p === "/api/me") {
           const plan = normalizePlan(user.plan);
-          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const planCfg = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
           const limits = effectiveTierLimit(planCfg, { plan, tps_override: user.tps_override != null ? Number(user.tps_override) : null });
           return apiJson(user, env, ttlMs, { user: sanitizeUser(user), plan,
             rateLimit: { perMinute: RATE_LIMIT, period: RATE_PERIOD },
@@ -948,7 +614,7 @@ export default {
         // ---- Self-serve plans: list + select (no payment — dummy pricing) ----
         if (request.method === "GET" && p === "/api/plans") {
           const plan = normalizePlan(user.plan);
-          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const planCfg = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
           return apiJson(user, env, ttlMs, {
             currentPlan: plan,
             plans: ["free", "pro", "dedicated"].map((name) => planView(name, planCfg[name])),
@@ -967,10 +633,10 @@ export default {
           const plan = normalizePlan(raw);
           const current = normalizePlan(user.plan);
           if (plan === current) {
-            const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            const planCfg = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
             return apiJson(user, env, ttlMs, { user: sanitizeUser({ ...user, plan }), plan, limits: effectiveTierLimit(planCfg, { plan, tps_override: null }), unchanged: true });
           }
-          await ensureUserTierColumns(env);
+          // updatePlanOnly() ensures tier columns itself.
           if (plan === "dedicated") {
             // Dedicated is sales-provisioned (Plans page shows Contact sales).
             // Self-serve selection is disabled; admins assign it via
@@ -979,7 +645,7 @@ export default {
           }
           // Downgrade guard: dropping to a plan with lower quotas must not
           // strand the user over quota — block with counts, don't auto-delete.
-          const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const planCfg = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
           const next = effectiveTierLimit(planCfg, { plan, tps_override: null });
           if (next.max_webhooks != null) {
             const n = await countUserWebhooks(env, user.id);
@@ -988,18 +654,19 @@ export default {
             }
           }
           if (next.max_subs_per_webhook != null) {
-            const rows = await env.DB.prepare("SELECT id FROM webhooks WHERE user_id=?").bind(user.id).all().catch(() => ({ results: [] }));
-            for (const w of rows.results || []) {
+            const { webhooks: planWebhooks } = createRepositories(env, null);
+            const rows = await planWebhooks.listIdsByUser(user.id).catch(() => []);
+            for (const w of rows || []) {
               const n = await countWebhookSubscriptions(env, w.id);
               if (n > next.max_subs_per_webhook) {
                 return apiJson(user, env, ttlMs, { error: `This plan allows ${next.max_subs_per_webhook} subscriptions per webhook (webhook ${w.id} has ${n}). Remove ${n - next.max_subs_per_webhook} subscription(s) first.` }, 403);
               }
             }
           }
-          await env.DB.prepare("UPDATE users SET plan=? WHERE id=?").bind(plan, user.id).run();
-          invalidateUserTier(env, ctx, user.id);
+          const { users: planUsers } = createRepositories(env, ctx);
+          await planUsers.updatePlanOnly(user.id, plan);
           console.log(JSON.stringify({ level: "info", msg: "user plan self-selected", userId: user.id, plan }));
-          const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(user.id).first().catch(() => null);
+          const updated = await planUsers.findById(user.id).catch(() => null);
           return apiJson(user, env, ttlMs, { user: updated ? sanitizeUser(updated) : { id: user.id, plan }, plan,
             limits: effectiveTierLimit(planCfg, { plan, tps_override: null }) });
         }
@@ -1007,17 +674,15 @@ export default {
         if (request.method === "GET" && p === "/api/webhooks") {
           // List page shows name, endpoint, subscription count and status
           // only — no delivery counters, so skip the counters join entirely.
-          const rows = await env.DB.prepare(`SELECT w.*,
-            COUNT(DISTINCT s.id) subscription_count
-            FROM webhooks w LEFT JOIN subscriptions s ON s.webhook_id=w.id
-            WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
-          return apiJson(user, env, ttlMs, { webhooks: rows.results.map(w => webhookView(w, request)) });
+          const { webhooks: listWebhooks } = createRepositories(env, null);
+          const rows = await listWebhooks.listByUserWithCounts(user.id);
+          return apiJson(user, env, ttlMs, { webhooks: rows.map(w => webhookView(w, request)) });
         }
 
         if (request.method === "POST" && p === "/api/webhooks") {
           const b = await readJson(request);
           // Plan quota: max webhooks per user (NULL = unlimited).
-          const planCfgForCreate = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+          const planCfgForCreate = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
           const createLimits = effectiveTierLimit(planCfgForCreate, { plan: normalizePlan(user.plan), tps_override: user.tps_override != null ? Number(user.tps_override) : null });
           if (createLimits.max_webhooks != null) {
             const n = await countUserWebhooks(env, user.id);
@@ -1032,22 +697,14 @@ export default {
           const name = String(b.name || "Untitled webhook").trim() || "Untitled webhook";
           const token = randomToken();
           const created = now();
-          await ensureWebhookFilterColumn(env);
           const filterCode = normalizeFilterCode(b.filter_code ?? b.filter ?? null);
-          let hook;
-          try {
-            hook = await env.DB.prepare("INSERT INTO webhooks (user_id,name,token,filter_code,created_at) VALUES (?,?,?,?,?)")
-              .bind(user.id, name, token, filterCode || null, created).run();
-          } catch {
-            hook = await env.DB.prepare("INSERT INTO webhooks (user_id,name,token,created_at) VALUES (?,?,?,?)")
-              .bind(user.id, name, token, created).run();
-          }
-          const wid = hook.meta.last_row_id;
+          const { webhooks: createWebhooks } = createRepositories(env, null);
+          const wid = await createWebhooks.create({ userId: user.id, name, token, filterCode, createdAt: created });
           const actions = normalizeActions(b.actions) || [];
           await saveActions(env, ctx, wid, actions);
           const subs = subsPre || [];
           await saveSubscriptions(env, ctx, wid, subs);
-          const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const w = await createWebhooks.findByIdAndUser(wid, user.id);
           const rel = await webhookRelations(env, wid);
           return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions }, 201);
         }
@@ -1055,48 +712,47 @@ export default {
         const hookIdMatch = p.match(/^\/api\/webhooks\/(\d+)$/);
         if ((request.method === "PUT" || request.method === "PATCH") && hookIdMatch) {
           const wid = Number(hookIdMatch[1]);
-          const existing = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const { webhooks: editWebhooks } = createRepositories(env, ctx);
+          const existing = await editWebhooks.findByIdAndUser(wid, user.id);
           if (!existing) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const b = await readJson(request);
           if (b.name !== undefined) {
             const name = String(b.name || "").trim();
             if (!name) return apiJson(user, env, ttlMs, { error: "Name is required" }, 400);
-            await env.DB.prepare("UPDATE webhooks SET name=? WHERE id=?").bind(name.slice(0, 200), wid).run();
-            invalidateWebhook(env, ctx, { id: wid, token: existing.token });
+            await editWebhooks.updateFields(wid, { name: name.slice(0, 200) });
+            editWebhooks.invalidate({ id: wid, token: existing.token });
           }
           if (b.status !== undefined) {
             if (!["active", "disabled"].includes(b.status)) return apiJson(user, env, ttlMs, { error: "Status must be active or disabled" }, 400);
-            await env.DB.prepare("UPDATE webhooks SET status=? WHERE id=?").bind(b.status, wid).run();
-            invalidateWebhook(env, ctx, { id: wid, token: existing.token });
+            await editWebhooks.updateFields(wid, { status: b.status });
+            editWebhooks.invalidate({ id: wid, token: existing.token });
           }
           if (b.filter_code !== undefined || b.filter !== undefined) {
-            await ensureWebhookFilterColumn(env);
             const fc = normalizeFilterCode(b.filter_code ?? b.filter);
             // fc === null means key present but null — treat as clear.
             const val = fc === null ? null : (fc || null);
-            try {
-              await env.DB.prepare("UPDATE webhooks SET filter_code=? WHERE id=?").bind(val, wid).run();
-            } catch { /* old DB without column — ignore */ }
-            invalidateWebhook(env, ctx, { id: wid, token: existing.token });
+            await editWebhooks.updateFields(wid, { filterCode: val });
+            editWebhooks.invalidate({ id: wid, token: existing.token });
           }
           const actions = normalizeActions(b.actions);
           if (actions) await saveActions(env, ctx, wid, actions);
           const subs = normalizeSubscriptions(b.subscriptions);
           if (subs) {
-            const planCfgForUpdate = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            const planCfgForUpdate = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
             const updateLimits = effectiveTierLimit(planCfgForUpdate, { plan: normalizePlan(user.plan), tps_override: user.tps_override != null ? Number(user.tps_override) : null });
             if (updateLimits.max_subs_per_webhook != null && subs.length > updateLimits.max_subs_per_webhook) {
               return apiJson(user, env, ttlMs, { error: `Plan limit reached: ${updateLimits.max_subs_per_webhook} subscriptions per webhook on the ${normalizePlan(user.plan)} plan.`, plan: normalizePlan(user.plan), limit: updateLimits.max_subs_per_webhook }, 403);
             }
             await mergeSubscriptions(env, ctx, wid, subs);
           }
-          const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const w = await editWebhooks.findByIdAndUser(wid, user.id);
           const rel = await webhookRelations(env, wid);
           return apiJson(user, env, ttlMs, { webhook: webhookView(w, request), actions: rel.actions, subscriptions: rel.subscriptions });
         }
         if (request.method === "GET" && hookIdMatch) {
           const wid = Number(hookIdMatch[1]);
-          const w = await env.DB.prepare("SELECT * FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const { webhooks: getWebhooks } = createRepositories(env, null);
+          const w = await getWebhooks.findByIdAndUser(wid, user.id);
           if (!w) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const rel = await webhookRelations(env, wid);
           const stats = sumSubscriptionStats(rel.subscriptions);
@@ -1109,26 +765,22 @@ export default {
         if (request.method === "GET" && subIdMatch) {
           // Single subscription with its own counters + per-day breakdown.
           const sid = Number(subIdMatch[1]);
-          await ensureSubscriptionCounterTables(env);
-          const sub = await env.DB.prepare(`SELECT s.*,
-            CASE WHEN s.secret IS NOT NULL AND s.secret != '' THEN 1 ELSE 0 END AS has_secret,
-            COALESCE(c.enqueued,0) enqueued, COALESCE(c.delivered_ok,0) delivered_ok, COALESCE(c.delivered_failed,0) delivered_failed
-            FROM subscriptions s LEFT JOIN subscription_counters c ON c.subscription_id=s.id
-            WHERE s.id=?`).bind(sid).first().catch(() => null);
+          const { counters: subCounters, webhooks: subWebhooks } = createRepositories(env, null);
+          const sub = await subCounters.findWithSubscription(sid);
           if (!sub) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const owns = await env.DB.prepare("SELECT id,name,token,status FROM webhooks WHERE id=? AND user_id=?").bind(sub.webhook_id, user.id).first();
+          const owns = await subWebhooks.findOwnerWebhook(sub.webhook_id, user.id);
           if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-          const daily = await env.DB.prepare(`SELECT day,enqueued,delivered_ok,delivered_failed,updated_at
-            FROM subscription_daily_counters WHERE subscription_id=? ORDER BY day DESC LIMIT 30`).bind(sid).all().catch(() => ({ results: [] }));
+          const daily = await subCounters.findDaily(sid, 30);
           return apiJson(user, env, ttlMs, { subscription: subscriptionView(sub),
             webhook: webhookView({ ...owns, subscription_count: 0 }, request),
-            daily: daily.results || [] });
+            daily: daily || [] });
         }
 
         const contextMatch = p.match(/^\/api\/webhooks\/(\d+)\/context$/);
         if (request.method === "GET" && contextMatch) {
           const wid = Number(contextMatch[1]);
-          const owns = await env.DB.prepare("SELECT id FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const { webhooks: ctxWebhooks } = createRepositories(env, null);
+          const owns = await ctxWebhooks.findByIdAndUser(wid, user.id);
           if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const { context, hasSample, eventId } = await sampleContextForWebhook(env, wid);
           return apiJson(user, env, ttlMs, { context, variables: listVariables(context), hasSample, eventId: eventId ?? null });
@@ -1137,7 +789,8 @@ export default {
         const previewMatch = p.match(/^\/api\/webhooks\/(\d+)\/subscriptions\/preview$/);
         if (request.method === "POST" && previewMatch) {
           const wid = Number(previewMatch[1]);
-          const owns = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const { webhooks: previewWebhooks, actions: previewActions } = createRepositories(env, null);
+          const owns = await previewWebhooks.findByIdAndUser(wid, user.id);
           if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const b = await readJson(request);
           const normalized = normalizeSubscriptions([b.subscription || b]);
@@ -1150,7 +803,7 @@ export default {
           let ctx = baseCtx;
           let preError = null;
           try {
-            const action = await env.DB.prepare("SELECT code FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order,id LIMIT 1").bind(wid).first();
+            const action = await previewActions.findPreCode(wid);
             if (action && action.code && String(action.code).trim()) {
               const r = evaluatePreAssignment(action.code, baseCtx);
               if (r.error) {
@@ -1162,15 +815,14 @@ export default {
           } catch { /* fall back to ctx above */ }
           // Evaluate webhook-level filter (stored or draft override) and the
           // subscription-level filter draft against the same context.
-          let webhookFilterCode = null;
-          try {
-            const wrow = await env.DB.prepare("SELECT filter_code FROM webhooks WHERE id=?").bind(wid).first().catch(() => null);
-            webhookFilterCode = wrow?.filter_code ?? null;
-          } catch { webhookFilterCode = null; }
-          if (b.webhook_filter_code !== undefined || b.filter_code !== undefined) {
-            const draft = normalizeFilterCode(b.webhook_filter_code ?? b.filter_code);
-            if (draft !== null) webhookFilterCode = draft || null;
-          }
+          const webhookFilterCode = await previewWebhooks.findFilterCodeById(wid).then(async (stored) => {
+            let code = stored;
+            if (b.webhook_filter_code !== undefined || b.filter_code !== undefined) {
+              const draft = normalizeFilterCode(b.webhook_filter_code ?? b.filter_code);
+              if (draft !== null) code = draft || null;
+            }
+            return code;
+          });
           const webhookFilter = evaluateFilter(webhookFilterCode, ctx);
           const subscriptionFilter = evaluateFilter(sub.filter_code, ctx);
           const rendered = renderSubscription({ ...sub, secret: undefined }, ctx);
@@ -1182,14 +834,15 @@ export default {
         const filterPreviewMatch = p.match(/^\/api\/webhooks\/(\d+)\/filter\/preview$/);
         if (request.method === "POST" && filterPreviewMatch) {
           const wid = Number(filterPreviewMatch[1]);
-          const owns = await env.DB.prepare("SELECT id,name FROM webhooks WHERE id=? AND user_id=?").bind(wid, user.id).first();
+          const { webhooks: filterWebhooks, actions: filterActions } = createRepositories(env, null);
+          const owns = await filterWebhooks.findByIdAndUser(wid, user.id);
           if (!owns) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
           const b = await readJson(request);
           const { context: sampleCtx } = await sampleContextForWebhook(env, wid);
           const baseCtx = { ...sampleCtx, webhook: { id: owns.id, name: owns.name || "" } };
           let ctx = baseCtx;
           try {
-            const action = await env.DB.prepare("SELECT code FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order,id LIMIT 1").bind(wid).first();
+            const action = await filterActions.findPreCode(wid);
             if (action && action.code && String(action.code).trim()) {
               const r = evaluatePreAssignment(action.code, baseCtx);
               if (!r.error) ctx = { ...baseCtx, pre: r.pre };
@@ -1207,8 +860,8 @@ export default {
           if (!isAdmin) return apiJson(user, env, ttlMs, { error: "Forbidden" }, 403);
 
           if (request.method === "GET" && p === "/api/admin/plans") {
-            await ensurePlansTable(env);
-            const cfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
+            // getAllCached() ensures the plans table itself.
+            const cfg = await repos.plans.getAllCached().catch(() => structuredFallbackPlans());
             return apiJson(user, env, ttlMs, { plans: ["free", "pro", "dedicated"].map((plan) => planView(plan, cfg[plan])) });
           }
 
@@ -1264,9 +917,10 @@ export default {
             if (description !== undefined && String(description).length > 300) {
               return apiJson(user, env, ttlMs, { error: "description must be ≤ 300 chars" }, 400);
             }
-            await ensurePlansTable(env);
-            const current = await env.DB.prepare("SELECT * FROM plans WHERE plan=?").bind(plan).first()
-              .catch(() => null) || FALLBACK_PLAN_LIMITS[plan];
+            const { plans: adminPlans } = createRepositories(env, ctx);
+            // findByPlan() ensures the plans table itself.
+            const current = await adminPlans.findByPlan(plan)
+              || FALLBACK_PLAN_LIMITS[plan];
             const next = {
               tps_limit: tps !== undefined ? Math.floor(Number(tps)) : Number(current.tps_limit),
               burst_limit: burst !== undefined ? Math.floor(Number(burst)) : Number(current.burst_limit),
@@ -1279,11 +933,7 @@ export default {
               infra: infra !== undefined ? String(infra).trim().toLowerCase() : (current.infra || FALLBACK_PLAN_LIMITS[plan].infra),
               description: description !== undefined ? (String(description) || null) : (current.description ?? FALLBACK_PLAN_LIMITS[plan].description ?? null),
             };
-            await env.DB.prepare(`UPDATE plans SET tps_limit=?, burst_limit=?, window_seconds=?, daily_limit=?,
-              max_webhooks=?, max_subs_per_webhook=?, price_cents=?, price_display=?, infra=?, description=?, updated_at=? WHERE plan=?`)
-              .bind(next.tps_limit, next.burst_limit, next.window_seconds, next.daily_limit,
-                next.max_webhooks, next.max_subs_per_webhook, next.price_cents, next.price_display, next.infra, next.description, now(), plan).run();
-            invalidatePlans(env, ctx);
+            await adminPlans.update(plan, next);
             console.log(JSON.stringify({ level: "info", msg: "plan updated", plan, ...next, by: user.id }));
             return apiJson(user, env, ttlMs, { plan, ...next });
           }
@@ -1315,14 +965,15 @@ export default {
             if (override != null && (!Number.isInteger(Number(override)) || Number(override) < 1 || Number(override) > 100000)) {
               return apiJson(user, env, ttlMs, { error: "tps_override must be an integer 1..100000 or null" }, 400);
             }
-            await ensureUserTierColumns(env);
-            const exists = await env.DB.prepare("SELECT id FROM users WHERE id=?").bind(targetId).first().catch(() => null);
+            const { users: adminUsers } = createRepositories(env, ctx);
+            // updatePlan() ensures tier columns itself.
+            const exists = await adminUsers.findById(targetId).catch(() => null);
             if (!exists) return apiJson(user, env, ttlMs, { error: "Not found" }, 404);
-            await env.DB.prepare("UPDATE users SET plan=?, dedicated_queue=?, tps_override=? WHERE id=?")
-              .bind(plan, dedicatedQueue, override != null ? Math.floor(Number(override)) : null, targetId).run();
-            invalidateUserTier(env, ctx, targetId);
+            await adminUsers.updatePlan(targetId, {
+              plan, dedicatedQueue, tpsOverride: override != null ? Math.floor(Number(override)) : null,
+            });
             console.log(JSON.stringify({ level: "info", msg: "user plan updated", userId: targetId, plan, dedicatedQueue, by: user.id }));
-            const updated = await env.DB.prepare("SELECT id,email,name,created_at,plan,dedicated_queue,tps_override,is_admin FROM users WHERE id=?").bind(targetId).first().catch(() => null);
+            const updated = await adminUsers.findById(targetId).catch(() => null);
             return apiJson(user, env, ttlMs, { user: updated ? sanitizeUser(updated) : { id: targetId, plan } });
           }
 
@@ -1353,14 +1004,13 @@ export default {
       const publicMatch = p.match(/^\/webhooks\/([^/]+)$/);
       if (publicMatch && ["POST", "PUT", "PATCH"].includes(request.method)) {
         const token = publicMatch[1];
-        // Hot path: webhook lookup is cached (memory + optional KV) so
-        // repeat traffic skips D1. Body read runs concurrently with the
-        // lookup so neither blocks the other — whichever is slower sets the
-        // latency, not the sum.
-        const hookPromise = getWebhookByToken(env, ctx, token, async () =>
-          env.DB.prepare("SELECT id, user_id, name, token, status FROM webhooks WHERE token=?")
-            .bind(token).first().catch(() => null)
-        );
+        // Hot path: webhook lookup is KV-cached so repeat traffic skips D1.
+        // Body read runs concurrently with the lookup so neither blocks the
+        // other — whichever is slower sets the latency, not the sum.
+        // All D1 access goes through repositories (IDbAccessor); no raw
+        // env.DB in this handler.
+        const { webhooks: ingestWebhooks, users: ingestUsers, plans: ingestPlans } = createRepositories(env, ctx);
+        const hookPromise = ingestWebhooks.findByTokenCached(token);
         const rawPromise = readBody(request);
         let hook;
         let raw;
@@ -1378,8 +1028,8 @@ export default {
         // tier onto the event so fan-out routes to the right delivery queue
         // even if the plan changes mid-flight.
         const [tierRow, planCfg] = await Promise.all([
-          getUserTier(env, ctx, hook.user_id, () => loadUserTier(env, hook.user_id)).catch(() => ({ plan: "free", dedicated_queue: null, tps_override: null })),
-          getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans()),
+          ingestUsers.findTierCached(hook.user_id).catch(() => ({ plan: "free", dedicated_queue: null, tps_override: null })),
+          ingestPlans.getAllCached().catch(() => structuredFallbackPlans()),
         ]);
         const tier = normalizePlan(tierRow?.plan);
         const tierCheck = await tierRateLimit(env, ctx, hook.user_id, { ...tierRow, plan: tier }, planCfg);

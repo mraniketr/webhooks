@@ -1,5 +1,5 @@
 import { buildContext, evaluateFilter } from "./template.js";
-import { getRouteConfig, getUserTier, invalidateRouteConfig } from "./cache.js";
+import { createRepositories } from "./repositories/index.js";
 import { analyticsDelay, analyticsMsg, emitAnalytics, eventDelay, logEventStatus, normalizeTier, now, rowFromMessage, runUserScript } from "./processing.js";
 import { processAnalyticsBatch } from "./analytics.js";
 
@@ -56,15 +56,9 @@ async function resolveEventTier(msg, env, ctx, webhookRow) {
   try {
     const userId = webhookRow?.user_id;
     if (!userId) return { tier: stamped, dedicatedQueue: stampedQueue, fresh: false };
-    const tierRow = await getUserTier(env, ctx, userId, async () => {
-      try {
-        const row = await env.DB.prepare("SELECT plan,dedicated_queue FROM users WHERE id=?").bind(userId).first();
-        if (!row) return null;
-        return { plan: row.plan || "free", dedicated_queue: row.dedicated_queue || null };
-      } catch {
-        return null;
-      }
-    }).catch(() => null);
+    // KV-cached owner tier via UserRepository — no raw env.DB here.
+    const { users } = createRepositories(env, ctx);
+    const tierRow = await users.findTierCached(userId).catch(() => null);
     if (!tierRow) return { tier: stamped, dedicatedQueue: stampedQueue, fresh: false };
     return {
       tier: normalizeTier(tierRow.plan),
@@ -91,43 +85,10 @@ async function processEvent(message, env, ctx) {
   const webhookId = Number(msg.webhookId);
   if (!eventId || !webhookId) return;
 
-  let route = await getRouteConfig(env, ctx, webhookId, async () => {
-    const [webhookRow, actions, subs] = await Promise.all([
-      env.DB.prepare("SELECT id,name,user_id,filter_code FROM webhooks WHERE id=?").bind(webhookId).first()
-        .catch(() => env.DB.prepare("SELECT id,name,filter_code FROM webhooks WHERE id=?").bind(webhookId).first()
-          .catch(() => env.DB.prepare("SELECT id,name FROM webhooks WHERE id=?").bind(webhookId).first().catch(() => null))),
-      env.DB.prepare(
-        "SELECT * FROM actions WHERE webhook_id=? AND enabled=1 AND phase='pre' ORDER BY sort_order, id"
-      ).bind(webhookId).all().catch(() => ({ results: [] })),
-      env.DB.prepare(
-        "SELECT id,filter_code FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
-      ).bind(webhookId).all().catch(() =>
-        env.DB.prepare("SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id").bind(webhookId).all().catch(() => ({ results: [] }))),
-    ]);
-    const subRows = (subs?.results || []).map((s) => ({ id: Number(s.id), filter_code: s.filter_code ?? null })).filter((s) => Boolean(s.id));
-    return {
-      webhookRow: webhookRow || null,
-      actions: actions?.results || [],
-      subIds: subRows.map((s) => s.id),
-      subs: subRows,
-    };
-  }).catch(() => null);
-
-  // Stale-empty guard: a cached "no subscriptions" entry must never drop a
-  // fan-out right after a subscription was added. Re-check D1 once and
-  // refresh the cache when the fresh list is non-empty.
-  if (route && (route.subIds || []).length === 0 && !(route.subs || []).length) {
-    try {
-      const fresh = await env.DB.prepare(
-        "SELECT id FROM subscriptions WHERE webhook_id=? AND enabled=1 ORDER BY id"
-      ).bind(webhookId).all().catch(() => null);
-      const freshIds = (fresh?.results || []).map((s) => Number(s.id)).filter(Boolean);
-      if (freshIds.length > 0) {
-        invalidateRouteConfig(env, ctx, webhookId);
-        route = { ...route, subIds: freshIds, subs: freshIds.map((id) => ({ id, filter_code: null })) };
-      }
-    } catch { /* keep cached route */ }
-  }
+  // Stale-empty guard lives in the repository: a cached "no subscriptions"
+  // entry must never drop a fan-out right after a subscription was added.
+  let route = await routes.getCached(webhookId).catch(() => null);
+  route = await routes.refreshWhenStaleEmpty(webhookId, route);
 
   const webhookRow = route?.webhookRow || null;
   const cachedActions = route?.actions || [];
