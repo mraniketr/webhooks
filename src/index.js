@@ -949,13 +949,8 @@ export default {
         if (request.method === "GET" && p === "/api/plans") {
           const plan = normalizePlan(user.plan);
           const planCfg = await getPlanConfig(env, ctx, () => loadPlanConfig(env)).catch(() => structuredFallbackPlans());
-          const [webhookCount, dailyUsed] = await Promise.all([
-            countUserWebhooks(env, user.id),
-            getUserDailyUsage(env, user.id).catch(() => 0),
-          ]);
           return apiJson(user, env, ttlMs, {
             currentPlan: plan,
-            usage: { webhooks: webhookCount, dailyUsed, day: utcDayString() },
             plans: ["free", "pro", "dedicated"].map((name) => planView(name, planCfg[name])),
           });
         }
@@ -1009,40 +1004,12 @@ export default {
             limits: effectiveTierLimit(planCfg, { plan, tps_override: null }) });
         }
 
-        if (request.method === "GET" && p === "/api/dashboard") {
-          // Subscription-level analytics only: totals are summed across the
-          // user's subscription_counters. Per-event history lives in worker
-          // logs (observability), not in D1.
-          await ensureSubscriptionCounterTables(env);
-          const sums = await env.DB.prepare(`SELECT
-            COALESCE(SUM(c.enqueued),0) enqueued,
-            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
-            COALESCE(SUM(c.delivered_failed),0) delivered_failed
-            FROM subscriptions s JOIN webhooks w ON w.id=s.webhook_id
-            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
-            WHERE w.user_id=?`).bind(user.id).first().catch(() => null);
-          const hooks = await env.DB.prepare(`SELECT w.*,
-            COUNT(DISTINCT s.id) subscription_count,
-            COALESCE(SUM(c.enqueued),0) enqueued,
-            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
-            COALESCE(SUM(c.delivered_failed),0) delivered_failed
-            FROM webhooks w LEFT JOIN subscriptions s ON s.webhook_id=w.id
-            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
-            WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
-          const enqueued = Number(sums?.enqueued || 0), ok = Number(sums?.delivered_ok || 0), failed = Number(sums?.delivered_failed || 0);
-          return apiJson(user, env, ttlMs, { stats: { enqueued, delivered_ok: ok, delivered_failed: failed, pending: Math.max(0, enqueued - ok - failed) },
-            webhooks: hooks.results.map(w => webhookView(w, request)) });
-        }
-
         if (request.method === "GET" && p === "/api/webhooks") {
-          await ensureSubscriptionCounterTables(env);
+          // List page shows name, endpoint, subscription count and status
+          // only — no delivery counters, so skip the counters join entirely.
           const rows = await env.DB.prepare(`SELECT w.*,
-            COUNT(DISTINCT s.id) subscription_count,
-            COALESCE(SUM(c.enqueued),0) enqueued,
-            COALESCE(SUM(c.delivered_ok),0) delivered_ok,
-            COALESCE(SUM(c.delivered_failed),0) delivered_failed
+            COUNT(DISTINCT s.id) subscription_count
             FROM webhooks w LEFT JOIN subscriptions s ON s.webhook_id=w.id
-            LEFT JOIN subscription_counters c ON c.subscription_id=s.id
             WHERE w.user_id=? GROUP BY w.id ORDER BY w.id DESC`).bind(user.id).all();
           return apiJson(user, env, ttlMs, { webhooks: rows.results.map(w => webhookView(w, request)) });
         }
