@@ -87,6 +87,7 @@ async function processEvent(message, env, ctx) {
 
   // Stale-empty guard lives in the repository: a cached "no subscriptions"
   // entry must never drop a fan-out right after a subscription was added.
+  const { routes } = createRepositories(env, ctx);
   let route = await routes.getCached(webhookId).catch(() => null);
   route = await routes.refreshWhenStaleEmpty(webhookId, route);
 
